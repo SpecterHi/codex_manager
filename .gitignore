@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*.log
+.DS_Store
+.env
+.env.*
+*.sqlite
+*.sqlite3
+*.db
+AGENT_HANDOFF.md
+AUTO_CONTINUE_AND_VISIBILITY.md
+VSCODE_TITLE_SYNC.md
