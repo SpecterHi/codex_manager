@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import fcntl
 import getpass
 import hashlib
 import hmac
@@ -55,6 +56,7 @@ class AppContext:
     targets_path: Path
     remote_marks_path: Path
     remote_watchlist_path: Path
+    supervisor_lock_path: Path
     lock: threading.Lock
     targets: Dict[str, "MachineTarget"]
     resume_jobs: Dict[str, "ResumeLaunch"]
@@ -62,6 +64,8 @@ class AppContext:
     remote_marks: Dict[str, "RemoteMark"]
     remote_watchlist: Dict[str, "RemoteWatch"]
     shutdown_event: threading.Event
+    supervisor_lock_handle: Optional[Any] = None
+    supervisor_lock_active: bool = False
 
 
 @dataclass
@@ -1659,6 +1663,8 @@ def launch_resume_for_record(
 
 
 def auto_continue_tick(app: AppContext) -> None:
+    if not app.supervisor_lock_active:
+        return
     with app.lock:
         if not app.remote_watchlist:
             return
@@ -1724,12 +1730,60 @@ def auto_continue_tick(app: AppContext) -> None:
 
 def auto_continue_loop(app: AppContext, interval_seconds: int = AUTO_CONTINUE_INTERVAL_SECONDS) -> None:
     while not app.shutdown_event.is_set():
+        if not app.supervisor_lock_active:
+            try:
+                handle = app.supervisor_lock_path.open("a+")
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                handle.seek(0)
+                handle.truncate(0)
+                handle.write(f"{os.getpid()}\n")
+                handle.flush()
+                app.supervisor_lock_handle = handle
+                app.supervisor_lock_active = True
+                print(
+                    f"[auto-continue] acquired supervisor lock {display_path(app.supervisor_lock_path)}",
+                    flush=True,
+                )
+            except BlockingIOError:
+                app.supervisor_lock_active = False
+                if app.supervisor_lock_handle is not None:
+                    try:
+                        app.supervisor_lock_handle.close()
+                    except Exception:
+                        pass
+                    app.supervisor_lock_handle = None
+                if app.shutdown_event.wait(min(interval_seconds, 10)):
+                    break
+                continue
+            except Exception as exc:
+                app.supervisor_lock_active = False
+                if app.supervisor_lock_handle is not None:
+                    try:
+                        app.supervisor_lock_handle.close()
+                    except Exception:
+                        pass
+                    app.supervisor_lock_handle = None
+                print(f"[auto-continue] supervisor lock setup failed: {exc}", flush=True)
+                if app.shutdown_event.wait(min(interval_seconds, 30)):
+                    break
+                continue
         try:
             auto_continue_tick(app)
         except Exception as exc:
             print(f"[auto-continue] supervisor tick failed: {exc}", flush=True)
         if app.shutdown_event.wait(interval_seconds):
             break
+    if app.supervisor_lock_handle is not None:
+        try:
+            fcntl.flock(app.supervisor_lock_handle.fileno(), fcntl.LOCK_UN)
+        except Exception:
+            pass
+        try:
+            app.supervisor_lock_handle.close()
+        except Exception:
+            pass
+        app.supervisor_lock_handle = None
+    app.supervisor_lock_active = False
 
 
 def close_resume_job(app: AppContext, session_id: str) -> Optional[ResumeLaunch]:
@@ -9134,6 +9188,7 @@ def main() -> int:
     targets_path = args.targets_file.expanduser().resolve()
     remote_marks_path = codex_home / "web_remote_marks.json"
     remote_watchlist_path = codex_home / "web_remote_watchlist.json"
+    supervisor_lock_path = codex_home / "web_auto_continue.lock"
     auth = load_auth_config(auth_file)
     context = AppContext(
         codex_home=codex_home,
@@ -9144,6 +9199,7 @@ def main() -> int:
         targets_path=targets_path,
         remote_marks_path=remote_marks_path,
         remote_watchlist_path=remote_watchlist_path,
+        supervisor_lock_path=supervisor_lock_path,
         lock=threading.Lock(),
         targets=load_machine_targets(targets_path),
         resume_jobs={},

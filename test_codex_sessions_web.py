@@ -302,6 +302,7 @@ class SessionEventsTest(unittest.TestCase):
                 targets_path=codex_home / "targets.json",
                 remote_marks_path=codex_home / "marks.json",
                 remote_watchlist_path=codex_home / "watch.json",
+                supervisor_lock_path=codex_home / "auto_continue.lock",
                 lock=threading.Lock(),
                 targets={},
                 resume_jobs={},
@@ -316,6 +317,7 @@ class SessionEventsTest(unittest.TestCase):
                     )
                 },
                 shutdown_event=mock.MagicMock(),
+                supervisor_lock_active=True,
             )
             record = SimpleNamespace(session_id="session-1", path=session_path, cwd="")
             calls: list[str] = []
