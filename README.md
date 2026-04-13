@@ -1,131 +1,201 @@
 # Codex Manager
 
-`codex_manager` is a local session supervisor for Codex.
+`codex_manager` is a local-first supervision console for Codex sessions.
 
-It focuses on three things:
+It is designed for the situation where the hard part is no longer "can an agent do the work?", but "can I reliably watch, steer, and recover several long-running sessions without opening every client and without loading giant session files into memory?".
 
-- inspect and organize local Codex sessions
-- watch active sessions through a bounded live event window instead of a full transcript dump
-- continue or nudge sessions from a web UI, including a lightweight phone-oriented page
+[中文说明 / Chinese README](./README.zh-CN.md)
 
-It can also proxy the same web actions to a small set of peer machines over SSH, so one control-plane page can observe and steer multiple Codex hosts.
+## What It Is Good At
 
-## What It Does
+- **Multi-session supervision**
+  - scan many Codex sessions from one page instead of living inside one active thread
+- **Bounded live observation**
+  - recent event windows, commentary, tool calls, tool-output summaries, and completion markers
+  - avoids loading entire giant `.jsonl` transcripts by default
+- **Phone-friendly intervention**
+  - `/remote` lightweight page for watching progress, nudging sessions, and stopping web-triggered resume jobs
+- **Conservative "keep going" automation**
+  - optional `持续推进` mode only resumes after an explicit `task_complete`
+  - no idle-time guessing
+  - single-instance supervisor lock prevents double-running loops
+- **Small-scale multi-machine control**
+  - switch between a few Codex hosts from one control plane
+  - bootstrap a remote host over `ssh + sudo -n` instead of manually babysitting a second checkout
+- **Safer remote operations**
+  - compatibility checks before attaching to a remote host
+  - service/version/API checks before bootstrap or takeover
 
-`codex_manager` has two entrypoints:
+## What It Is Not
+
+`codex_manager` is intentionally **not** trying to replace every other Codex-adjacent tool.
+
+- It is **not** the best choice when you mainly want one polished active-thread coding UI with diff review and worktree-centric development. The official Codex app is better for that.
+- It is **not** a chat-platform bridge. If your main workflow is Feishu / Slack / Telegram / Discord as the primary control surface, a project like `cc-connect` is a better fit.
+- It is **not** a mobile-first encrypted remote-control product. If your main goal is "take over one live agent from my phone anywhere", a project like `Happy` is more aligned.
+
+This project is optimized for a different problem:
+
+> "I already have real Codex sessions running on local or remote machines. I need a bounded, low-drama way to watch them, decide which one needs intervention, and continue them from desktop or phone."
+
+## Where It Stands Relative To Similar Projects
+
+| Tool | Best At | Where `codex_manager` Is Different |
+| --- | --- | --- |
+| [OpenAI Codex app](https://openai.com/index/introducing-the-codex-app/) | one active coding thread, diff review, isolated coding workflows, official app-server UX | `codex_manager` is stronger when you want a duty-console view over many existing sessions and a bounded tail-oriented live window |
+| [Happy](https://github.com/slopus/happy) | mobile/web remote control, push notifications, device switching, encrypted remote-mode experience | `codex_manager` does not wrap your CLI usage; it watches existing session artifacts and is better at side-by-side multi-session triage |
+| [cc-connect](https://github.com/chenhg5/cc-connect) | chat-platform bridge for agents across Feishu / Slack / Telegram / Discord / WeChat Work | `codex_manager` is a browser control plane, not a ChatOps bridge; the focus is observability and intervention, not IM integration |
+
+The core differentiators here are:
+
+- **Bounded-memory session observation**
+  - the UI is built around recent event windows and tail reads, not full transcript hydration
+- **Conservative supervision**
+  - explicit `task_complete` handling, not "it has been quiet for a while so maybe resume"
+- **Shared multi-browser control plane**
+  - remote machine definitions live on the server, so desktop and phone see the same target list
+- **Bootstrap instead of manual duplicate setup**
+  - for supported remote machines, the UI can check, deploy, upgrade, and register the remote helper service
+
+## Current Product Shape
+
+`codex_manager` currently has two entrypoints.
 
 - `codex_sessions.py`
   - CLI for listing, inspecting, renaming, archiving, deleting, and resuming sessions
 - `codex_sessions_web.py`
-  - local web UI with:
-    - `/` full manager
-    - `/remote` lightweight mobile-first dashboard
-
-Core capabilities:
-
-- session inventory with title, source, workdir, size, timestamps, and derived metadata
-- live recent-event timeline for a selected session
-- recent history fallback without loading entire giant `.jsonl` files
-- safe-ish remote continue / stop controls for web-triggered runs
-- multi-machine target switching over SSH
-- optional local password auth for non-loopback access
-- conservative auto-continue for long-running sessions that truly reached `task_complete`
-
-## Why This Exists
-
-The default Codex clients are good at one active conversation. They are not optimized for:
-
-- scanning many sessions at once
-- spotting which session is still moving, which is idle, and which likely needs intervention
-- watching tool calls / commentary / completion markers across multiple threads
-- nudging a session from a phone without opening a full desktop client
-
-`codex_manager` is intentionally closer to a duty console than a transcript browser.
-
-## Product Shape
+  - web UI and JSON APIs
+  - full manager at `/`
+  - lightweight mobile page at `/remote`
 
 ### Full Manager: `/`
 
-Desktop and tablet view:
+The main page is a two-pane supervision console:
 
-- left side: fleet list for scanning many sessions
-- right side: selected-session live console
+- **left**: fleet list
+  - scan many sessions quickly
+  - see state, recent progress, attention cues, and lightweight metadata
+- **right**: selected-session live console
+  - recent commentary
+  - tool calls
+  - tool-output summaries
+  - token/completion markers
+  - explicit history fetch when needed
 
-The right side is a bounded sliding window. It emphasizes:
+It is deliberately **not** a full transcript browser by default.
 
-- commentary
-- tool calls
-- tool output summaries
-- token / completion markers
-- recent user/Codex turns when you explicitly ask for history
+### Lightweight Page: `/remote`
 
-It does **not** try to load an entire huge session file by default.
+The lightweight page is designed for phone and tablet use:
 
-### Lightweight Remote Page: `/remote`
-
-Phone-first view for away-from-computer use:
-
-- pinned watched sessions
-- quick filters like `自动推进中`, `需人工介入`, `像是已完成`
-- one-tap continue
-- one-tap stop for web-triggered runs
-- custom follow-up input
+- watched sessions
+- quick filters
 - recent 3-round context fallback
-- optional `持续推进` mode
+- one-tap continue
+- one-tap stop for web-triggered resume jobs
+- optional `持续推进`
 
-`持续推进` is conservative:
+`持续推进` is intentionally conservative:
 
 - checks every 3 minutes
-- only triggers after an explicit `task_complete`
-- records the last completed turn it already resumed
-- does not use idle-time guessing
+- only resumes after explicit `task_complete`
+- records the completed turn it already resumed
+- uses a supervisor lock so only one web instance performs the loop
 
-## Architecture
+## Remote-Host Model
 
-The runtime model is deliberately simple:
+The remote model is now:
 
-- session files are read from Codex home on disk
-- recent live state is derived from session tails and recent structured events
-- non-local targets are reached over SSH, then forwarded to the target machine's own loopback-bound web service
+- one control-plane machine serves the UI
+- each target machine runs its own loopback-bound `codex_manager` web service
+- the control plane proxies API actions over SSH to that target
 
-This means:
+This is intentional. It avoids re-implementing the entire session model over ad-hoc SSH parsing.
 
-- the HTML comes from the control-plane machine
-- the actual session operations still happen on the target machine
-- password auth for SSH targets can be used from the browser, but those passwords stay in browser session storage and are not written into server-side target presets
+### Why Not "Raw SSH Only"?
 
-## Naming Model
+Because once you need all of these reliably:
 
-The tool keeps several naming concepts separate:
+- session inventory
+- bounded event windows
+- recent history fallback
+- continue/stop semantics
+- conservative auto-continue
+- compatibility checks
 
-- `alias`
-  - local nickname only
-- `session title`
-  - local title override stored in session metadata / preview
-- `official title`
-  - Codex thread title synced through `codex app-server` when available
-- `display title`
-  - best UI label, typically preferring VS Code task-list naming when present
-- `source`
-  - single client-facing thread source such as `vscode`, `cli`, or `exec`
+...a tiny loopback helper on the target is simpler and more predictable than teaching the control plane to parse everything remotely from scratch.
 
-Important constraint:
+### Remote Bootstrap
 
-- `source` is single-valued
-- a thread cannot honestly present itself as both `vscode` and `cli` at the same time
+If you have:
+
+- SSH access
+- `sudo -n true`
+- `python3`
+- `curl`
+- `tar`
+
+then you can bootstrap a remote target from the current local checkout:
+
+```bash
+python codex_sessions_bootstrap.py \
+  --host remote-host \
+  --user your-ssh-user \
+  --label "Remote box" \
+  --bind-port 8765
+```
+
+The helper will:
+
+- package the current repository
+- upload it over SSH
+- install it under `~/.local/share/codex_manager`
+- write/update a `systemd` unit
+- start the loopback-bound service on the remote host
+- verify `http://127.0.0.1:<port>/api/remote_sessions`
+- optionally register the target locally
+
+The web UI can also:
+
+- check whether a target already has `codex_manager`
+- check whether the service is running
+- verify API compatibility (`sessions`, `remote_sessions`, `events`)
+- compare remote release metadata against the local checkout
+
+## Authentication And Exposure Model
+
+The web UI supports optional password auth.
+
+Typical deployment pattern:
+
+- direct loopback access can bypass login
+- non-loopback access requires password
+- mutating requests require CSRF protection
+
+Example local URLs:
+
+- `http://127.0.0.1:8765/`
+- `http://127.0.0.1:8765/remote`
+
+On this machine, the service is often exposed to the LAN with:
+
+- loopback bypass for local use
+- password required for LAN / tunnel access
+- LAN-only firewall rules on the Linux side
+- matching WSL / Hyper-V port allow rules on Windows
 
 ## Repository Layout
 
 - `codex_sessions.py`
   - CLI entrypoint
 - `codex_sessions_web.py`
-  - web UI and API server
-- `codex_sessions.sh`
-  - CLI shell wrapper
-- `codex_sessions_web.sh`
-  - web shell wrapper
+  - web UI, APIs, remote proxying, supervision logic
+- `codex_sessions_bootstrap.py`
+  - SSH + sudo remote bootstrap / upgrade helper
+- `codex_manager_release.py`
+  - release metadata and version comparison helpers
 - `test_codex_sessions_web.py`
-  - tests for web-side behavior
+  - web/API behavior tests
 
 ## Quick Start
 
@@ -161,7 +231,7 @@ Then open:
 - `http://127.0.0.1:8765/`
 - `http://127.0.0.1:8765/remote`
 
-## Web Routes And APIs
+## Main Routes And APIs
 
 Main routes:
 
@@ -190,6 +260,7 @@ Mutating APIs:
 - `POST /api/archive`
 - `POST /api/delete`
 - `POST /api/targets`
+- `POST /api/targets/delete`
 
 Compatibility aliases still exist:
 
@@ -197,92 +268,30 @@ Compatibility aliases still exist:
 - `POST /api/unname` -> `POST /api/clear_title`
 - `POST /api/set_cwd` -> `POST /api/set_workdir`
 
-## Authentication And Security
-
-The web UI supports optional local password auth.
-
-Behavior:
-
-- direct loopback access (`127.0.0.1` / `localhost`) can be allowed without a password
-- proxied / tunneled access requires login when the auth file exists
-- unauthenticated API requests return `401`
-- mutating API requests require CSRF protection
-
-Generate a random password:
-
-```bash
-uv run python codex_sessions_web.py \
-  --auth-file ~/.config/codex-sessions-web/auth.json \
-  --set-random-password
-```
-
-Set a password from stdin:
-
-```bash
-printf '%s' 'your-new-password' | \
-uv run python codex_sessions_web.py \
-  --auth-file ~/.config/codex-sessions-web/auth.json \
-  --set-password-stdin
-```
-
-Do not commit the auth file. Do not store plaintext passwords in this repository.
-
-## Deployment Notes
-
-Recommended deployment model:
-
-- keep the Python server bound to loopback
-- publish it behind a reverse proxy or tunnel if you need remote access
-- use the loopback bypass only for direct on-machine use
-
-Example systemd-oriented workflow:
-
-```bash
-sudo systemctl status codex-sessions-web.service
-sudo systemctl restart codex-sessions-web.service
-journalctl -u codex-sessions-web.service -f
-```
-
-Exact bind address and port vary by deployment.
-
-## Multi-Machine Use
-
-The built-in target switcher is designed for a small number of explicitly configured hosts.
-
-Model:
-
-- `local` is always present
-- ad-hoc target profiles can live in browser `localStorage`
-- optional server-managed presets can live in `~/.config/codex-sessions-web/targets.json`
-- the control-plane machine talks to the target machine over SSH
-- the target machine runs its own loopback-bound `codex_sessions_web.py`
-
-Preferred auth path:
-
-- SSH keys
-
-Supported fallback:
-
-- password auth from the browser modal, stored only in browser session storage
-
 ## Development
 
 Basic checks:
 
 ```bash
-python -m py_compile codex_sessions.py codex_sessions_web.py test_codex_sessions_web.py
+python -m py_compile \
+  codex_sessions.py \
+  codex_sessions_web.py \
+  codex_sessions_bootstrap.py \
+  codex_manager_release.py \
+  test_codex_sessions_web.py
+
 python -m unittest test_codex_sessions_web.py
 ```
 
 ## Version Control Notes
 
-Some deployments use colocated `jj + git`, while others are plain runtime directories.
+Some deployments are plain Git repos. Some are colocated `jj + git`. Some are runtime copies without either.
 
 Check what you actually have before assuming workflow:
 
 ```bash
-jj status
 git status
+jj status
 ```
 
 ## License

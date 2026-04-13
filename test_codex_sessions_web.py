@@ -22,6 +22,129 @@ def write_jsonl(path: Path, rows: list[dict]) -> None:
 
 
 class SessionEventsTest(unittest.TestCase):
+    def test_parse_target_base_url_accepts_loopback_default(self) -> None:
+        host, port = web.parse_target_base_url("http://127.0.0.1:8765")
+        self.assertEqual(host, "127.0.0.1")
+        self.assertEqual(port, 8765)
+
+    def test_build_target_from_payload_keeps_password_auth(self) -> None:
+        target = web.build_target_from_payload(
+            {
+                "label": "remote-a",
+                "ssh_host": "192.168.1.9",
+                "ssh_user": "ubuntu",
+                "ssh_port": 2222,
+                "base_url": "http://127.0.0.1:9000",
+                "auth_mode": "password",
+                "ssh_password": "secret",
+            }
+        )
+        self.assertEqual(target.target_id, "ubuntu@192.168.1.9:2222")
+        self.assertEqual(target.base_url, "http://127.0.0.1:9000")
+        self.assertEqual(target.auth_mode, "password")
+        self.assertEqual(target.ssh_password, "secret")
+
+    def test_save_and_load_machine_targets_roundtrip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "targets.json"
+            targets = {
+                web.LOCAL_TARGET_ID: web.build_local_target(),
+                "ubuntu@example.com:22": web.MachineTarget(
+                    target_id="ubuntu@example.com:22",
+                    label="Example",
+                    kind="ssh",
+                    ssh_host="example.com",
+                    ssh_user="ubuntu",
+                    ssh_port=22,
+                    base_url="http://127.0.0.1:8765",
+                    auth_mode="password",
+                ),
+            }
+            web.save_machine_targets(path, targets)
+            loaded = web.load_machine_targets(path)
+            self.assertIn(web.LOCAL_TARGET_ID, loaded)
+            self.assertIn("ubuntu@example.com:22", loaded)
+            self.assertEqual(loaded["ubuntu@example.com:22"].label, "Example")
+            self.assertEqual(loaded["ubuntu@example.com:22"].auth_mode, "password")
+
+    def test_enrich_target_check_result_marks_version_match(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            (repo_root / "codex_sessions_web.py").write_text("print('ok')\n", encoding="utf-8")
+            local_release = web.build_release_metadata(repo_root)
+            result = web.enrich_target_check_result(
+                {
+                    "ok": True,
+                    "api_ready": True,
+                    "compat_sessions": True,
+                    "compat_remote_sessions": True,
+                    "compat_events": True,
+                    "compat_session_id": "sess-1",
+                    "release_metadata": dict(local_release),
+                },
+                repo_root,
+            )
+            self.assertTrue(result["version_match"])
+            self.assertEqual(result["recommendation"], "ready")
+            self.assertEqual(result["remote_version_label"], result["local_version_label"])
+
+    def test_enrich_target_check_result_marks_update_when_remote_differs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            (repo_root / "codex_sessions_web.py").write_text("print('ok')\n", encoding="utf-8")
+            result = web.enrich_target_check_result(
+                {
+                    "ok": True,
+                    "api_ready": True,
+                    "compat_sessions": True,
+                    "compat_remote_sessions": True,
+                    "compat_events": True,
+                    "compat_session_id": "sess-1",
+                    "release_metadata": {"content_digest": "deadbeef" * 8, "git_commit_short": "old1234"},
+                },
+                repo_root,
+            )
+            self.assertFalse(result["version_match"])
+            self.assertEqual(result["recommendation"], "update_recommended")
+
+    def test_enrich_target_check_result_requires_upgrade_when_capability_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            (repo_root / "codex_sessions_web.py").write_text("print('ok')\n", encoding="utf-8")
+            result = web.enrich_target_check_result(
+                {
+                    "ok": True,
+                    "api_ready": True,
+                    "compat_sessions": True,
+                    "compat_remote_sessions": False,
+                    "compat_events": False,
+                    "compat_session_id": "",
+                    "release_metadata": web.build_release_metadata(repo_root),
+                },
+                repo_root,
+            )
+            self.assertFalse(result["compat_ready"])
+            self.assertEqual(result["recommendation"], "upgrade_required_for_ui")
+
+    def test_enrich_target_check_result_keeps_legacy_process_conflict(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            (repo_root / "codex_sessions_web.py").write_text("print('ok')\n", encoding="utf-8")
+            result = web.enrich_target_check_result(
+                {
+                    "ok": True,
+                    "api_ready": False,
+                    "compat_sessions": False,
+                    "compat_remote_sessions": False,
+                    "compat_events": False,
+                    "compat_session_id": "",
+                    "recommendation": "legacy_process_conflict",
+                    "listener_command": "python3 /home/dell/codex_manager/codex_sessions_web.py --port 8765",
+                },
+                repo_root,
+            )
+            self.assertEqual(result["recommendation"], "legacy_process_conflict")
+
     def test_parse_tool_output_event_extracts_command_and_exit_code(self) -> None:
         obj = {
             "type": "response_item",

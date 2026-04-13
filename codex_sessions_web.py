@@ -44,6 +44,12 @@ from codex_sessions import (
     source_sort_key,
     title_looks_noisy,
 )
+from codex_manager_release import (
+    RELEASE_METADATA_FILENAME,
+    build_release_metadata,
+    compare_release_metadata,
+    version_label,
+)
 
 
 @dataclass
@@ -134,6 +140,9 @@ AUTO_CONTINUE_LABEL = "自动续跑"
 AUTO_CONTINUE_PROMPT = "请继续持续推进"
 AUTO_CONTINUE_INTERVAL_SECONDS = 180
 LOCAL_TARGET_ID = "local"
+DEFAULT_TARGET_BASE_URL = "http://127.0.0.1:8765"
+DEFAULT_REMOTE_INSTALL_BASE = "~/.local/share/codex_manager"
+DEFAULT_REMOTE_SERVICE_NAME = "codex-sessions-web.service"
 PROXYABLE_GET_PATHS = {
     "/api/sessions",
     "/api/sources",
@@ -188,6 +197,185 @@ except urllib.error.HTTPError as exc:
 except Exception as exc:
     error = {"ok": False, "error": f"Remote API proxy failed: {exc}"}
     print(json.dumps({"status": 599, "body": json.dumps(error, ensure_ascii=False)}, ensure_ascii=False))
+"""
+
+REMOTE_TARGET_CHECK_SCRIPT = r"""
+import json
+import os
+import shutil
+import subprocess
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+request_args = REQUEST
+service_name = str(request_args.get("service_name") or "codex-sessions-web.service")
+bind_host = str(request_args.get("bind_host") or "127.0.0.1")
+bind_port = int(request_args.get("bind_port") or 8765)
+remote_base = str(request_args.get("remote_base") or "~/.local/share/codex_manager")
+release_metadata_filename = ".codex_manager_release.json"
+
+
+def ok(command):
+    completed = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    return completed.returncode == 0
+
+
+def capture(command):
+    completed = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if completed.returncode != 0:
+        return ""
+    return completed.stdout.strip()
+
+
+result = {
+    "ok": True,
+    "service_name": service_name,
+    "bind_host": bind_host,
+    "bind_port": bind_port,
+    "remote_base": remote_base,
+    "python_ok": shutil.which("python3") is not None,
+    "curl_ok": shutil.which("curl") is not None,
+    "tar_ok": shutil.which("tar") is not None,
+}
+result["sudo_ok"] = ok(["sudo", "-n", "true"])
+result["service_installed"] = False
+result["service_enabled"] = False
+result["service_active"] = False
+result["working_directory"] = ""
+result["detected_remote_base"] = remote_base
+result["release_metadata"] = None
+result["port_in_use"] = False
+result["listener_pid"] = ""
+result["listener_command"] = ""
+result["listener_matches_expected_release"] = False
+if result["sudo_ok"]:
+    result["service_installed"] = ok(["sudo", "test", "-f", f"/etc/systemd/system/{service_name}"]) or ok(["sudo", "systemctl", "cat", service_name])
+    result["service_enabled"] = ok(["sudo", "systemctl", "is-enabled", service_name])
+    result["service_active"] = ok(["sudo", "systemctl", "is-active", service_name])
+    working_directory = capture(["sudo", "systemctl", "show", service_name, "-p", "WorkingDirectory", "--value"])
+    if working_directory.startswith("/"):
+        result["working_directory"] = working_directory
+        if working_directory.endswith("/current"):
+            result["detected_remote_base"] = str(Path(working_directory).parent)
+        else:
+            result["detected_remote_base"] = working_directory
+
+listener_line = capture(["sudo", "ss", "-ltnp"])
+for line in listener_line.splitlines():
+    if f":{bind_port} " not in line and not line.rstrip().endswith(f":{bind_port}"):
+        continue
+    result["port_in_use"] = True
+    marker = 'pid='
+    if marker in line:
+        tail = line.split(marker, 1)[1]
+        pid = tail.split(",", 1)[0].split(")", 1)[0].strip()
+        if pid:
+            result["listener_pid"] = pid
+            cmdline = capture(["ps", "-p", pid, "-o", "args="])
+            if cmdline:
+                result["listener_command"] = cmdline
+    break
+
+expected_release_marker = ""
+if result["working_directory"]:
+    expected_release_marker = str(Path(result["working_directory"]))
+elif str(result["detected_remote_base"]).strip():
+    expected_release_marker = str(Path(os.path.expanduser(result["detected_remote_base"])) / "current")
+if expected_release_marker and result["listener_command"]:
+    result["listener_matches_expected_release"] = expected_release_marker in result["listener_command"]
+
+metadata_candidates = []
+if result["working_directory"]:
+    metadata_candidates.append(Path(result["working_directory"]) / release_metadata_filename)
+metadata_candidates.append(Path(os.path.expanduser(result["detected_remote_base"])) / "current" / release_metadata_filename)
+seen_paths = set()
+for metadata_path in metadata_candidates:
+    normalized = str(metadata_path)
+    if normalized in seen_paths:
+        continue
+    seen_paths.add(normalized)
+    try:
+        result["release_metadata"] = json.loads(metadata_path.read_text(encoding="utf-8"))
+        break
+    except Exception:
+        continue
+
+result["api_ready"] = False
+result["auth_enabled"] = False
+result["local_bypass"] = False
+result["api_error"] = ""
+result["compat_sessions"] = False
+result["compat_remote_sessions"] = False
+result["compat_events"] = False
+result["compat_session_id"] = ""
+try:
+    with urllib.request.urlopen(f"http://{bind_host}:{bind_port}/api/auth/session", timeout=4) as response:
+        payload = json.loads(response.read().decode("utf-8", errors="replace"))
+    result["api_ready"] = True
+    result["auth_enabled"] = bool(payload.get("auth_enabled"))
+    result["local_bypass"] = bool(payload.get("local_bypass"))
+except urllib.error.HTTPError as exc:
+    result["api_error"] = f"HTTP {int(exc.code)}"
+except Exception as exc:
+    result["api_error"] = str(exc)
+
+if result["api_ready"]:
+    try:
+        with urllib.request.urlopen(f"http://{bind_host}:{bind_port}/api/sessions?limit=1", timeout=4) as response:
+            payload = json.loads(response.read().decode("utf-8", errors="replace"))
+        if isinstance(payload, dict) and payload.get("ok") is True:
+            result["compat_sessions"] = True
+            sessions = payload.get("sessions") or []
+            if isinstance(sessions, list) and sessions:
+                first = sessions[0]
+                if isinstance(first, dict):
+                    result["compat_session_id"] = str(first.get("id") or "").strip()
+    except Exception:
+        pass
+    try:
+        with urllib.request.urlopen(f"http://{bind_host}:{bind_port}/api/remote_sessions?limit=1", timeout=4) as response:
+            payload = json.loads(response.read().decode("utf-8", errors="replace"))
+        if isinstance(payload, dict) and payload.get("ok") is True:
+            result["compat_remote_sessions"] = True
+    except Exception:
+        pass
+    if result["compat_session_id"]:
+        try:
+            session_id = urllib.parse.quote(result["compat_session_id"], safe="")
+            with urllib.request.urlopen(
+                f"http://{bind_host}:{bind_port}/api/events?session={session_id}&limit=1",
+                timeout=4,
+            ) as response:
+                payload = json.loads(response.read().decode("utf-8", errors="replace"))
+            if isinstance(payload, dict) and payload.get("ok") is True:
+                result["compat_events"] = True
+        except Exception:
+            pass
+
+if result["api_ready"] and result["compat_sessions"] and result["compat_remote_sessions"] and (
+    result["compat_events"] or not result["compat_session_id"]
+):
+    result["recommendation"] = "ready"
+elif result["service_active"]:
+    result["recommendation"] = "service_running_but_api_unreachable"
+elif result["service_installed"] and result["port_in_use"] and not result["listener_matches_expected_release"]:
+    result["recommendation"] = "legacy_process_conflict"
+elif result["service_installed"] and result["port_in_use"]:
+    result["recommendation"] = "port_conflict"
+elif result["service_installed"]:
+    result["recommendation"] = "service_installed_but_inactive"
+elif result["port_in_use"] and result["listener_command"]:
+    result["recommendation"] = "port_occupied_without_service"
+elif result["port_in_use"]:
+    result["recommendation"] = "port_occupied_without_service"
+elif result["sudo_ok"] and result["python_ok"] and result["curl_ok"] and result["tar_ok"]:
+    result["recommendation"] = "bootstrap_recommended"
+else:
+    result["recommendation"] = "prerequisites_missing"
+
+print(json.dumps({"status": 200, "body": json.dumps(result, ensure_ascii=False)}, ensure_ascii=False))
 """
 
 
@@ -1140,6 +1328,74 @@ def target_to_public_dict(target: MachineTarget) -> Dict[str, Any]:
         "base_url": target.base_url,
         "auth_mode": normalize_target_auth_mode(target.auth_mode),
     }
+
+
+def parse_target_base_url(base_url: str) -> tuple[str, int]:
+    text = str(base_url or "").strip() or DEFAULT_TARGET_BASE_URL
+    parsed = urlparse(text)
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError("base_url must start with http:// or https://")
+    host = str(parsed.hostname or "").strip()
+    if not host:
+        raise ValueError("base_url is missing a hostname")
+    port = int(parsed.port or (443 if parsed.scheme == "https" else 80))
+    return host, port
+
+
+def build_target_from_payload(payload: Dict[str, Any]) -> MachineTarget:
+    label = str(payload.get("label") or "").strip()
+    ssh_host = str(payload.get("ssh_host") or payload.get("host") or "").strip()
+    ssh_user = str(payload.get("ssh_user") or payload.get("user") or "").strip()
+    try:
+        ssh_port = int(payload.get("ssh_port") or payload.get("port") or 22)
+    except Exception:
+        ssh_port = 22
+    ssh_port = max(1, min(65535, ssh_port))
+    base_url = str(payload.get("base_url") or DEFAULT_TARGET_BASE_URL).strip() or DEFAULT_TARGET_BASE_URL
+    auth_mode = normalize_target_auth_mode(str(payload.get("auth_mode") or payload.get("ssh_auth") or "key"))
+    ssh_password = str(payload.get("ssh_password") or "")
+    if not ssh_host:
+        raise ValueError("Missing `ssh_host`")
+    if not ssh_user:
+        raise ValueError("Missing `ssh_user`")
+    target_id = make_target_id(ssh_user=ssh_user, ssh_host=ssh_host, ssh_port=ssh_port)
+    return MachineTarget(
+        target_id=target_id,
+        label=label or target_id,
+        kind="ssh",
+        ssh_host=ssh_host,
+        ssh_user=ssh_user,
+        ssh_port=ssh_port,
+        base_url=base_url,
+        auth_mode=auth_mode,
+        ssh_password=ssh_password,
+    )
+
+
+def enrich_target_check_result(result: Dict[str, Any], repo_root: Path) -> Dict[str, Any]:
+    local_release = build_release_metadata(repo_root)
+    remote_release = result.get("release_metadata")
+    result["local_release_metadata"] = local_release
+    result["local_version_label"] = version_label(local_release)
+    result["remote_version_label"] = version_label(remote_release)
+    version_match = compare_release_metadata(local_release, remote_release)
+    result["version_match"] = version_match
+    is_compatible = bool(result.get("compat_sessions")) and bool(result.get("compat_remote_sessions")) and (
+        bool(result.get("compat_events")) or not str(result.get("compat_session_id") or "").strip()
+    )
+    result["compat_ready"] = is_compatible
+    if str(result.get("recommendation") or "") in {"legacy_process_conflict", "port_conflict", "port_occupied_without_service"}:
+        return result
+    if result.get("api_ready") and is_compatible:
+        if version_match is True:
+            result["recommendation"] = "ready"
+        elif version_match is False:
+            result["recommendation"] = "update_recommended"
+        else:
+            result["recommendation"] = "ready_unknown_version"
+    elif result.get("api_ready"):
+        result["recommendation"] = "upgrade_required_for_ui"
+    return result
 
 
 def load_machine_targets(path: Path) -> Dict[str, MachineTarget]:
@@ -2119,6 +2375,18 @@ class SessionHandler(BaseHTTPRequestHandler):
         }
         script_text = f"REQUEST = {remote_request!r}\n{REMOTE_API_PROXY_SCRIPT}"
 
+        return self._run_remote_python_payload(target, script_text)
+
+    def _run_remote_python_payload(
+        self,
+        target: MachineTarget,
+        script_text: str,
+        *,
+        timeout: int = 40,
+    ) -> tuple[int, Dict[str, Any]]:
+        if target.kind == "local":
+            return HTTPStatus.BAD_REQUEST, {"ok": False, "error": "Local target should not be proxied"}
+
         command = [
             "ssh",
             "-o",
@@ -2181,7 +2449,7 @@ class SessionHandler(BaseHTTPRequestHandler):
                 capture_output=True,
                 text=True,
                 check=False,
-                timeout=40,
+                timeout=timeout,
                 env=env,
             )
         except subprocess.TimeoutExpired:
@@ -2234,6 +2502,151 @@ class SessionHandler(BaseHTTPRequestHandler):
             body.setdefault("target", target.target_id)
             body.setdefault("target_label", target.label)
         return status, body
+
+    def _handle_check_target(self, payload: Dict[str, Any]) -> None:
+        try:
+            target = build_target_from_payload(payload)
+            bind_host, bind_port = parse_target_base_url(target.base_url)
+        except ValueError as exc:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+            return
+
+        remote_request = {
+            "service_name": str(payload.get("service_name") or DEFAULT_REMOTE_SERVICE_NAME).strip() or DEFAULT_REMOTE_SERVICE_NAME,
+            "bind_host": bind_host,
+            "bind_port": bind_port,
+            "remote_base": str(payload.get("remote_base") or DEFAULT_REMOTE_INSTALL_BASE).strip() or DEFAULT_REMOTE_INSTALL_BASE,
+        }
+        script_text = f"REQUEST = {remote_request!r}\n{REMOTE_TARGET_CHECK_SCRIPT}"
+        status, response_payload = self._run_remote_python_payload(target, script_text, timeout=20)
+        if status == HTTPStatus.OK and isinstance(response_payload, dict) and response_payload.get("ok") is True:
+            response_payload = enrich_target_check_result(response_payload, Path(__file__).resolve().parent)
+        self._send_json(status, response_payload)
+
+    def _handle_bootstrap_target(self, payload: Dict[str, Any]) -> None:
+        try:
+            target = build_target_from_payload(payload)
+            bind_host, bind_port = parse_target_base_url(target.base_url)
+        except ValueError as exc:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+            return
+
+        helper_path = Path(__file__).with_name("codex_sessions_bootstrap.py")
+        if not helper_path.exists():
+            self._send_json(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                {"ok": False, "error": f"Missing bootstrap helper: {helper_path}"},
+            )
+            return
+        remote_request = {
+            "service_name": str(payload.get("service_name") or DEFAULT_REMOTE_SERVICE_NAME).strip() or DEFAULT_REMOTE_SERVICE_NAME,
+            "bind_host": bind_host,
+            "bind_port": bind_port,
+            "remote_base": str(payload.get("remote_base") or DEFAULT_REMOTE_INSTALL_BASE).strip() or DEFAULT_REMOTE_INSTALL_BASE,
+        }
+        script_text = f"REQUEST = {remote_request!r}\n{REMOTE_TARGET_CHECK_SCRIPT}"
+        check_status, check_payload = self._run_remote_python_payload(target, script_text, timeout=20)
+        if check_status == HTTPStatus.OK and isinstance(check_payload, dict) and check_payload.get("ok") is True:
+            check_payload = enrich_target_check_result(check_payload, Path(__file__).resolve().parent)
+            if str(check_payload.get("recommendation") or "") in {"legacy_process_conflict", "port_conflict", "port_occupied_without_service"}:
+                listener_hint = compact_preview(str(check_payload.get("listener_command") or ""), 240)
+                self._send_json(
+                    HTTPStatus.CONFLICT,
+                    {
+                        "ok": False,
+                        "error": (
+                            f"Bootstrap blocked for {target.label}: remote port {bind_port} is occupied"
+                            + (f" by {listener_hint}" if listener_hint else "")
+                        ),
+                        "check": check_payload,
+                    },
+                )
+                return
+        command = [
+            sys.executable,
+            str(helper_path),
+            "--host",
+            target.ssh_host,
+            "--user",
+            target.ssh_user,
+            "--ssh-port",
+            str(int(target.ssh_port or 22)),
+            "--label",
+            target.label,
+            "--bind-host",
+            bind_host,
+            "--bind-port",
+            str(bind_port),
+            "--remote-base",
+            str(payload.get("remote_base") or DEFAULT_REMOTE_INSTALL_BASE),
+            "--service-name",
+            str(payload.get("service_name") or DEFAULT_REMOTE_SERVICE_NAME),
+            "--skip-target-config",
+        ]
+        env = os.environ.copy()
+        if target.auth_mode == "password" and target.ssh_password:
+            env["CODEX_BOOTSTRAP_SSH_PASSWORD"] = target.ssh_password
+        try:
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=240,
+                env=env,
+            )
+        except subprocess.TimeoutExpired:
+            self._send_json(
+                HTTPStatus.GATEWAY_TIMEOUT,
+                {"ok": False, "error": f"Bootstrap timed out for {target.label}"},
+            )
+            return
+        stdout_text = (completed.stdout or "").strip()
+        stderr_text = (completed.stderr or "").strip()
+        if completed.returncode != 0:
+            print(
+                f"[bootstrap] target={target.label} rc={completed.returncode} "
+                f"stdout={compact_preview(stdout_text, 600)!r} stderr={compact_preview(stderr_text, 600)!r}",
+                flush=True,
+            )
+            detail = compact_preview(stderr_text or stdout_text, 240)
+            self._send_json(
+                HTTPStatus.BAD_GATEWAY,
+                {
+                    "ok": False,
+                    "error": f"Bootstrap failed for {target.label}: {detail or f'exit {completed.returncode}'}",
+                    "stdout": compact_preview(stdout_text, 500),
+                    "stderr": compact_preview(stderr_text, 500),
+                },
+            )
+            return
+        print(
+            f"[bootstrap] target={target.label} ok stdout={compact_preview(stdout_text, 300)!r}",
+            flush=True,
+        )
+
+        with self.app.lock:
+            self.app.targets[target.target_id] = MachineTarget(
+                target_id=target.target_id,
+                label=target.label,
+                kind="ssh",
+                ssh_host=target.ssh_host,
+                ssh_user=target.ssh_user,
+                ssh_port=target.ssh_port,
+                base_url=target.base_url,
+                auth_mode=target.auth_mode,
+            )
+            save_machine_targets(self.app.targets_path, self.app.targets)
+        self._send_json(
+            HTTPStatus.OK,
+            {
+                "ok": True,
+                "message": "Remote codex_manager bootstrapped and saved",
+                "target": target_to_public_dict(target),
+                "stdout": compact_preview(stdout_text, 500),
+                "stderr": compact_preview(stderr_text, 500),
+            },
+        )
 
     def _maybe_proxy_remote_request(
         self,
@@ -2679,33 +3092,11 @@ class SessionHandler(BaseHTTPRequestHandler):
         )
 
     def _handle_save_target(self, payload: Dict[str, Any]) -> None:
-        label = str(payload.get("label") or "").strip()
-        ssh_host = str(payload.get("ssh_host") or payload.get("host") or "").strip()
-        ssh_user = str(payload.get("ssh_user") or payload.get("user") or "").strip()
         try:
-            ssh_port = int(payload.get("ssh_port") or payload.get("port") or 22)
-        except Exception:
-            ssh_port = 22
-        ssh_port = max(1, min(65535, ssh_port))
-        base_url = str(payload.get("base_url") or "http://127.0.0.1:8765").strip() or "http://127.0.0.1:8765"
-
-        if not ssh_host:
-            self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "Missing `ssh_host`"})
+            target = build_target_from_payload(payload)
+        except ValueError as exc:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
             return
-        if not ssh_user:
-            self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "Missing `ssh_user`"})
-            return
-
-        target_id = make_target_id(ssh_user=ssh_user, ssh_host=ssh_host, ssh_port=ssh_port)
-        target = MachineTarget(
-            target_id=target_id,
-            label=label or target_id,
-            kind="ssh",
-            ssh_host=ssh_host,
-            ssh_user=ssh_user,
-            ssh_port=ssh_port,
-            base_url=base_url,
-        )
         status, response_payload = self._run_remote_target_request(
             target,
             method="GET",
@@ -2722,7 +3113,16 @@ class SessionHandler(BaseHTTPRequestHandler):
             return
 
         with self.app.lock:
-            self.app.targets[target_id] = target
+            self.app.targets[target.target_id] = MachineTarget(
+                target_id=target.target_id,
+                label=target.label,
+                kind="ssh",
+                ssh_host=target.ssh_host,
+                ssh_user=target.ssh_user,
+                ssh_port=target.ssh_port,
+                base_url=target.base_url,
+                auth_mode=target.auth_mode,
+            )
             save_machine_targets(self.app.targets_path, self.app.targets)
         self._send_json(
             HTTPStatus.OK,
@@ -2730,6 +3130,27 @@ class SessionHandler(BaseHTTPRequestHandler):
                 "ok": True,
                 "message": "Target saved",
                 "target": target_to_public_dict(target),
+            },
+        )
+
+    def _handle_delete_target(self, payload: Dict[str, Any]) -> None:
+        target_id = normalize_target_id(str(payload.get("target") or payload.get("id") or "").strip())
+        if not target_id or target_id == LOCAL_TARGET_ID:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "Local target cannot be deleted"})
+            return
+        with self.app.lock:
+            existing = self.app.targets.get(target_id)
+            if existing is None or existing.kind == "local":
+                self._send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": f"Unknown target: {target_id}"})
+                return
+            self.app.targets.pop(target_id, None)
+            save_machine_targets(self.app.targets_path, self.app.targets)
+        self._send_json(
+            HTTPStatus.OK,
+            {
+                "ok": True,
+                "message": "Target deleted",
+                "target_id": target_id,
             },
         )
 
@@ -2999,6 +3420,15 @@ class SessionHandler(BaseHTTPRequestHandler):
 
         if parsed.path == "/api/targets":
             self._handle_save_target(payload)
+            return
+        if parsed.path == "/api/targets/delete":
+            self._handle_delete_target(payload)
+            return
+        if parsed.path == "/api/targets/check":
+            self._handle_check_target(payload)
+            return
+        if parsed.path == "/api/targets/bootstrap":
+            self._handle_bootstrap_target(payload)
             return
 
         if self._maybe_proxy_remote_request(parsed=parsed, method="POST", payload=payload):
@@ -3994,6 +4424,52 @@ REMOTE_HTML = r"""<!doctype html>
       -webkit-overflow-scrolling: touch;
       scrollbar-gutter: stable both-edges;
     }
+    .preview.preview-markdown {
+      white-space: normal;
+    }
+    .preview.preview-markdown p { margin: 0 0 8px; }
+    .preview.preview-markdown p:last-child { margin-bottom: 0; }
+    .preview.preview-markdown ul, .preview.preview-markdown ol { margin: 0 0 8px 20px; padding: 0; }
+    .preview.preview-markdown li { margin: 2px 0; }
+    .preview.preview-markdown blockquote {
+      margin: 0 0 8px;
+      padding-left: 12px;
+      border-left: 3px solid #cbd5e1;
+      color: #475569;
+    }
+    .preview.preview-markdown pre {
+      margin: 0 0 8px;
+      padding: 10px 12px;
+      border-radius: 10px;
+      background: #0f172a;
+      color: #e2e8f0;
+      overflow: auto;
+      font-size: 12px;
+      line-height: 1.5;
+    }
+    .preview.preview-markdown code {
+      font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+      font-size: 12px;
+      background: #e2e8f0;
+      padding: 0.1em 0.35em;
+      border-radius: 6px;
+    }
+    .preview.preview-markdown pre code {
+      background: transparent;
+      padding: 0;
+      color: inherit;
+    }
+    .preview.preview-markdown h1, .preview.preview-markdown h2, .preview.preview-markdown h3,
+    .preview.preview-markdown h4, .preview.preview-markdown h5, .preview.preview-markdown h6 {
+      margin: 0 0 8px;
+      line-height: 1.3;
+    }
+    .preview.preview-markdown hr {
+      border: 0;
+      border-top: 1px solid var(--line);
+      margin: 10px 0;
+    }
+    .preview.preview-markdown a { color: #0f766e; text-decoration: underline; }
     .preview-label {
       margin-top: 12px;
       color: var(--muted);
@@ -4234,6 +4710,9 @@ REMOTE_HTML = r"""<!doctype html>
       </div>
       <div class="history-actions">
         <button id="targetCancelBtn" type="button">取消</button>
+        <button id="targetDeleteBtn" type="button" class="danger">删除机器</button>
+        <button id="targetCheckBtn" type="button">检查远端</button>
+        <button id="targetBootstrapBtn" type="button">部署并保存</button>
         <button id="targetSaveBtn" type="button" class="primary">保存并测试</button>
       </div>
     </div>
@@ -4289,6 +4768,9 @@ REMOTE_HTML = r"""<!doctype html>
     const targetBaseUrlInputEl = document.getElementById("targetBaseUrlInput");
     const targetCloseBtnEl = document.getElementById("targetCloseBtn");
     const targetCancelBtnEl = document.getElementById("targetCancelBtn");
+    const targetDeleteBtnEl = document.getElementById("targetDeleteBtn");
+    const targetCheckBtnEl = document.getElementById("targetCheckBtn");
+    const targetBootstrapBtnEl = document.getElementById("targetBootstrapBtn");
     const targetSaveBtnEl = document.getElementById("targetSaveBtn");
     const DEFAULT_CONTINUE_LABEL = "继续自动推进";
     const CONTINUOUS_ENTER_LABEL = "进入持续推进";
@@ -4298,7 +4780,6 @@ REMOTE_HTML = r"""<!doctype html>
     const AUTO_CONTINUE_PROMPT = "请继续持续推进";
     const LOCAL_TARGET_ID = "local";
     const TARGET_STORAGE_KEY = "codex-target-id";
-    const TARGET_PROFILES_STORAGE_KEY = "codex-target-profiles";
     const TARGET_SECRETS_SESSION_KEY = "codex-target-secrets";
     const REMOTE_FILTER_STORAGE_KEY = "codex-remote-filter";
     const REMOTE_FILTERS = [
@@ -4324,51 +4805,11 @@ REMOTE_HTML = r"""<!doctype html>
     }
 
     function shouldAttachTarget(path) {
-      return !(path.startsWith("/api/auth/session") || path.startsWith("/api/logout"));
+      return !(path.startsWith("/api/auth/session") || path.startsWith("/api/logout") || path.startsWith("/api/targets"));
     }
 
     function builtinLocalTarget() {
       return { id: LOCAL_TARGET_ID, label: "本机", kind: "local", ssh_host: "", ssh_user: "", ssh_port: 22, base_url: "", auth_mode: "key" };
-    }
-
-    function loadStoredTargetProfiles() {
-      try {
-        const raw = JSON.parse(window.localStorage.getItem(TARGET_PROFILES_STORAGE_KEY) || "[]");
-        if (!Array.isArray(raw)) return [];
-        return raw
-          .filter((item) => item && typeof item === "object")
-          .map((item) => ({
-            id: String(item.id || "").trim(),
-            label: String(item.label || item.id || "").trim(),
-            kind: "ssh",
-            ssh_host: String(item.ssh_host || "").trim(),
-            ssh_user: String(item.ssh_user || "").trim(),
-            ssh_port: Number.parseInt(String(item.ssh_port || "22"), 10) || 22,
-            base_url: String(item.base_url || "http://127.0.0.1:8765").trim() || "http://127.0.0.1:8765",
-            auth_mode: String(item.auth_mode || "key").trim().toLowerCase() === "password" ? "password" : "key",
-          }))
-          .filter((item) => item.id && item.ssh_host && item.ssh_user);
-      } catch (error) {
-        return [];
-      }
-    }
-
-    function saveStoredTargetProfiles(items) {
-      try {
-        const payload = (items || [])
-          .filter((item) => item && item.id !== LOCAL_TARGET_ID)
-          .map((item) => ({
-            id: item.id,
-            label: item.label,
-            ssh_host: item.ssh_host,
-            ssh_user: item.ssh_user,
-            ssh_port: item.ssh_port,
-            base_url: item.base_url,
-            auth_mode: item.auth_mode === "password" ? "password" : "key",
-          }));
-        window.localStorage.setItem(TARGET_PROFILES_STORAGE_KEY, JSON.stringify(payload));
-      } catch (error) {
-      }
     }
 
     function loadStoredTargetSecrets() {
@@ -4454,6 +4895,13 @@ REMOTE_HTML = r"""<!doctype html>
       }
     }
 
+    function clearLegacyTargetProfiles() {
+      try {
+        window.localStorage.removeItem("codex-target-profiles");
+      } catch (error) {
+      }
+    }
+
     function currentTargetLabel() {
       const found = targetItems.find((item) => item.id === currentTargetId);
       return found ? String(found.label || found.id || currentTargetId) : currentTargetId;
@@ -4473,9 +4921,35 @@ REMOTE_HTML = r"""<!doctype html>
       saveTarget(currentTargetId);
     }
 
+    function normalizeTargetList(items) {
+      if (!Array.isArray(items)) return [];
+      return items
+        .filter((item) => item && typeof item === "object")
+        .map((item) => ({
+          id: String(item.id || "").trim(),
+          label: String(item.label || item.id || "").trim(),
+          kind: String(item.kind || "ssh").trim() || "ssh",
+          ssh_host: String(item.ssh_host || "").trim(),
+          ssh_user: String(item.ssh_user || "").trim(),
+          ssh_port: Number.parseInt(String(item.ssh_port || "22"), 10) || 22,
+          base_url: String(item.base_url || "http://127.0.0.1:8765").trim() || "http://127.0.0.1:8765",
+          auth_mode: String(item.auth_mode || "key").trim().toLowerCase() === "password" ? "password" : "key",
+        }))
+        .filter((item) => item.id);
+    }
+
     async function loadTargets(preserveCurrent = true) {
       targetSecrets = loadStoredTargetSecrets();
-      targetItems = [builtinLocalTarget(), ...loadStoredTargetProfiles()];
+      clearLegacyTargetProfiles();
+      let serverItems = [];
+      try {
+        const data = await api("/api/targets");
+        serverItems = normalizeTargetList(data.targets || []);
+      } catch (error) {
+        serverItems = [builtinLocalTarget()];
+      }
+      if (!serverItems.some((item) => item.id === LOCAL_TARGET_ID)) serverItems.unshift(builtinLocalTarget());
+      targetItems = serverItems;
       const preferred = preserveCurrent ? currentTargetId : loadSavedTarget();
       currentTargetId = targetItems.some((item) => item.id === preferred) ? preferred : LOCAL_TARGET_ID;
       renderTargetOptions();
@@ -4510,6 +4984,7 @@ REMOTE_HTML = r"""<!doctype html>
       targetPasswordInputEl.value = activeTarget ? targetPasswordFor(activeTarget.id) : "";
       targetBaseUrlInputEl.value = activeTarget ? String(activeTarget.base_url || "") : "http://127.0.0.1:8765";
       syncTargetPasswordField();
+      targetDeleteBtnEl.style.display = activeTarget && activeTarget.id !== LOCAL_TARGET_ID ? "" : "none";
       targetBackdropEl.style.display = "block";
       targetPanelEl.style.display = "block";
       targetLabelInputEl.focus();
@@ -4518,6 +4993,7 @@ REMOTE_HTML = r"""<!doctype html>
 
     function closeTargetEditor() {
       targetEditorOriginalId = "";
+      targetDeleteBtnEl.style.display = "none";
       targetBackdropEl.style.display = "none";
       targetPanelEl.style.display = "none";
       targetMetaEl.textContent = "填写目标机 SSH 信息。密码只保存在当前浏览器会话，不写入持久配置。";
@@ -4563,13 +5039,73 @@ REMOTE_HTML = r"""<!doctype html>
       };
     }
 
+    function buildTargetPayload(target, password) {
+      return {
+        label: target.label,
+        ssh_host: target.ssh_host,
+        ssh_user: target.ssh_user,
+        ssh_port: target.ssh_port,
+        base_url: target.base_url,
+        auth_mode: target.auth_mode,
+        ssh_password: password || "",
+      };
+    }
+
+    function describeTargetCheck(data) {
+      const bits = [];
+      if (data.recommendation === "legacy_process_conflict") {
+        bits.push("远端端口被旧手工实例占用，需先清理旧版再接管");
+      } else if (data.recommendation === "port_conflict") {
+        bits.push("远端端口已被占用，新服务无法接管");
+      } else if (data.recommendation === "port_occupied_without_service") {
+        bits.push("远端端口已被其他进程占用");
+      } else if (data.recommendation === "upgrade_required_for_ui") {
+        bits.push("远端已安装，但接口能力不足以支撑当前 UI，需升级");
+      } else if (data.recommendation === "update_recommended") {
+        bits.push("远端 codex_manager 已就绪，但版本落后于当前机器");
+      } else if (data.recommendation === "ready_unknown_version") {
+        bits.push("远端 codex_manager 已就绪，但版本未知");
+      } else if (data.api_ready) {
+        bits.push("远端 codex_manager 已就绪");
+      } else if (data.service_active) {
+        bits.push("服务在跑，但 API 暂不可达");
+      } else if (data.service_installed) {
+        bits.push("远端已安装，但服务未运行");
+      } else {
+        bits.push("远端尚未安装 codex_manager");
+      }
+      bits.push(`sudo: ${data.sudo_ok ? "ok" : "缺失"}`);
+      bits.push(`python3: ${data.python_ok ? "ok" : "缺失"}`);
+      bits.push(`curl: ${data.curl_ok ? "ok" : "缺失"}`);
+      bits.push(`tar: ${data.tar_ok ? "ok" : "缺失"}`);
+      bits.push(`sessions: ${data.compat_sessions ? "ok" : "缺失"}`);
+      bits.push(`remote_sessions: ${data.compat_remote_sessions ? "ok" : "缺失"}`);
+      if (data.compat_session_id) bits.push(`events: ${data.compat_events ? "ok" : "缺失"}`);
+      if (data.listener_pid) bits.push(`占用进程 PID: ${data.listener_pid}`);
+      if (data.listener_command) bits.push(`占用命令: ${data.listener_command}`);
+      if (data.remote_version_label) bits.push(`远端版本: ${data.remote_version_label}`);
+      if (data.local_version_label) bits.push(`当前版本: ${data.local_version_label}`);
+      if (data.api_error) bits.push(`API: ${data.api_error}`);
+      return bits.join(" | ");
+    }
+
     async function saveTargetEditor() {
       const { target, password } = buildTargetDraftFromEditor();
-      targetMetaEl.textContent = `正在测试连接：${target.label || target.id}`;
-      await testTargetConnection(target, password);
-      const stored = loadStoredTargetProfiles().filter((item) => item.id !== target.id && item.id !== targetEditorOriginalId);
-      stored.push(target);
-      saveStoredTargetProfiles(stored);
+      targetMetaEl.textContent = `正在检查远端：${target.label || target.id}`;
+      const check = await api("/api/targets/check", {
+        method: "POST",
+        headers: jsonHeaders(),
+        body: JSON.stringify(buildTargetPayload(target, password))
+      });
+      targetMetaEl.textContent = describeTargetCheck(check);
+      if (!["ready", "ready_unknown_version"].includes(String(check.recommendation || ""))) {
+        throw new Error("远端尚未达到可直接接管状态，请先检查或部署更新");
+      }
+      await api("/api/targets", {
+        method: "POST",
+        headers: jsonHeaders(),
+        body: JSON.stringify(buildTargetPayload(target, password))
+      });
       if (targetEditorOriginalId && targetEditorOriginalId !== target.id) {
         delete targetSecrets[targetEditorOriginalId];
       }
@@ -4584,6 +5120,69 @@ REMOTE_HTML = r"""<!doctype html>
       renderTargetOptions();
       closeTargetEditor();
       toast(`已保存机器：${target.label || target.id}`);
+    }
+
+    async function checkTargetEditor() {
+      const { target, password } = buildTargetDraftFromEditor();
+      targetMetaEl.textContent = `正在检查远端：${target.label || target.id}`;
+      const data = await api("/api/targets/check", {
+        method: "POST",
+        headers: jsonHeaders(),
+        body: JSON.stringify(buildTargetPayload(target, password))
+      });
+      targetMetaEl.textContent = describeTargetCheck(data);
+      return data;
+    }
+
+    async function bootstrapTargetEditor() {
+      const { target, password } = buildTargetDraftFromEditor();
+      targetMetaEl.textContent = `正在部署远端：${target.label || target.id}`;
+      const data = await api("/api/targets/bootstrap", {
+        method: "POST",
+        headers: jsonHeaders(),
+        body: JSON.stringify(buildTargetPayload(target, password))
+      });
+      await api("/api/targets", {
+        method: "POST",
+        headers: jsonHeaders(),
+        body: JSON.stringify(buildTargetPayload(target, password))
+      });
+      if (targetEditorOriginalId && targetEditorOriginalId !== target.id) {
+        delete targetSecrets[targetEditorOriginalId];
+      }
+      if (target.auth_mode === "password") {
+        targetSecrets[target.id] = { password };
+      } else {
+        delete targetSecrets[target.id];
+      }
+      saveTargetSecrets();
+      await loadTargets(false);
+      currentTargetId = target.id;
+      renderTargetOptions();
+      closeTargetEditor();
+      toast(data.message || `已部署并保存：${target.label || target.id}`);
+      return data;
+    }
+
+    async function deleteTargetEditor() {
+      const targetId = String(targetEditorOriginalId || "").trim();
+      if (!targetId || targetId === LOCAL_TARGET_ID) return;
+      const target = targetItems.find((item) => item.id === targetId) || currentTarget();
+      if (!confirm(`删除目标机器 ${target.label || targetId} ?`)) return;
+      const data = await api("/api/targets/delete", {
+        method: "POST",
+        headers: jsonHeaders(),
+        body: JSON.stringify({ target: targetId })
+      });
+      delete targetSecrets[targetId];
+      saveTargetSecrets();
+      await loadTargets(false);
+      if (currentTargetId === targetId) {
+        currentTargetId = LOCAL_TARGET_ID;
+        saveTarget(currentTargetId);
+      }
+      closeTargetEditor();
+      toast(data.message || `已删除机器：${target.label || targetId}`);
     }
 
     async function api(path, options = {}, targetOverride = null, passwordOverride = "") {
@@ -4749,6 +5348,155 @@ REMOTE_HTML = r"""<!doctype html>
       const value = String(text || "").trim();
       if (!value) return DEFAULT_CONTINUE_LABEL;
       return value === DEFAULT_CONTINUE_PROMPT ? DEFAULT_CONTINUE_LABEL : value;
+    }
+
+    function escapeHtml(text) {
+      return (text || "").replace(/[&<>\"']/g, (char) => {
+        if (char === "&") return "&amp;";
+        if (char === "<") return "&lt;";
+        if (char === ">") return "&gt;";
+        if (char === "\"") return "&quot;";
+        return "&#39;";
+      });
+    }
+
+    function sanitizeUrl(url) {
+      const value = String(url || "").trim();
+      if (!value) return "";
+      if (/^(https?:\/\/|mailto:)/i.test(value)) {
+        return value.replace(/"/g, "%22");
+      }
+      return "";
+    }
+
+    function renderInlineMarkdown(text) {
+      let raw = String(text || "");
+      const codeSpans = [];
+      raw = raw.replace(/`([^`\n]+)`/g, (_, codeText) => {
+        const idx = codeSpans.push(`<code>${escapeHtml(codeText)}</code>`) - 1;
+        return `@@INLINE_CODE_${idx}@@`;
+      });
+
+      const links = [];
+      raw = raw.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_, label, href) => {
+        const safeHref = sanitizeUrl(href);
+        const safeLabel = escapeHtml(label);
+        if (!safeHref) return safeLabel;
+        const idx = links.push(`<a href="${safeHref}" target="_blank" rel="noopener noreferrer">${safeLabel}</a>`) - 1;
+        return `@@LINK_${idx}@@`;
+      });
+
+      let output = escapeHtml(raw);
+      output = output.replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>");
+      output = output.replace(/(^|[^\*])\*([^*\n]+)\*(?!\*)/g, "$1<em>$2</em>");
+      output = output.replace(/~~([^~\n]+)~~/g, "<del>$1</del>");
+      output = output.replace(/\n/g, "<br />");
+      output = output.replace(/@@LINK_(\d+)@@/g, (_, idx) => links[Number(idx)] || "");
+      output = output.replace(/@@INLINE_CODE_(\d+)@@/g, (_, idx) => codeSpans[Number(idx)] || "");
+      return output;
+    }
+
+    function renderMarkdown(text) {
+      let raw = String(text || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+      const codeBlocks = [];
+      raw = raw.replace(/```([^\n`]*)\n([\s\S]*?)```/g, (_, lang, codeText) => {
+        const idx = codeBlocks.push({ lang: String(lang || "").trim(), code: codeText }) - 1;
+        return `@@CODE_BLOCK_${idx}@@`;
+      });
+
+      const lines = raw.split("\n");
+      const html = [];
+      let index = 0;
+
+      function isBlockStart(value) {
+        const line = String(value || "").trim();
+        if (!line) return false;
+        if (/^@@CODE_BLOCK_\d+@@$/.test(line)) return true;
+        if (/^#{1,6}\s+/.test(line)) return true;
+        if (/^>\s?/.test(line)) return true;
+        if (/^\s*[-*+]\s+/.test(line)) return true;
+        if (/^\s*\d+\.\s+/.test(line)) return true;
+        if (/^(\-{3,}|\*{3,}|_{3,})$/.test(line)) return true;
+        return false;
+      }
+
+      while (index < lines.length) {
+        const line = lines[index];
+        const trimmed = String(line || "").trim();
+        if (!trimmed) {
+          index += 1;
+          continue;
+        }
+
+        const codeMatch = trimmed.match(/^@@CODE_BLOCK_(\d+)@@$/);
+        if (codeMatch) {
+          const item = codeBlocks[Number(codeMatch[1])];
+          if (item) {
+            const className = item.lang ? ` class="language-${escapeHtml(item.lang)}"` : "";
+            const codeHtml = escapeHtml(String(item.code || "").replace(/\n$/, ""));
+            html.push(`<pre><code${className}>${codeHtml}</code></pre>`);
+          }
+          index += 1;
+          continue;
+        }
+
+        const headingMatch = String(line).match(/^(#{1,6})\s+(.*)$/);
+        if (headingMatch) {
+          const level = headingMatch[1].length;
+          html.push(`<h${level}>${renderInlineMarkdown(headingMatch[2].trim())}</h${level}>`);
+          index += 1;
+          continue;
+        }
+
+        if (/^>\s?/.test(trimmed)) {
+          const quoteLines = [];
+          while (index < lines.length && /^>\s?/.test(String(lines[index] || "").trim())) {
+            quoteLines.push(String(lines[index] || "").replace(/^>\s?/, ""));
+            index += 1;
+          }
+          html.push(`<blockquote>${renderInlineMarkdown(quoteLines.join("\n"))}</blockquote>`);
+          continue;
+        }
+
+        if (/^\s*[-*+]\s+/.test(line)) {
+          const items = [];
+          while (index < lines.length && /^\s*[-*+]\s+/.test(String(lines[index] || ""))) {
+            items.push(String(lines[index] || "").replace(/^\s*[-*+]\s+/, "").trim());
+            index += 1;
+          }
+          html.push(`<ul>${items.map((item) => `<li>${renderInlineMarkdown(item)}</li>`).join("")}</ul>`);
+          continue;
+        }
+
+        if (/^\s*\d+\.\s+/.test(line)) {
+          const items = [];
+          while (index < lines.length && /^\s*\d+\.\s+/.test(String(lines[index] || ""))) {
+            items.push(String(lines[index] || "").replace(/^\s*\d+\.\s+/, "").trim());
+            index += 1;
+          }
+          html.push(`<ol>${items.map((item) => `<li>${renderInlineMarkdown(item)}</li>`).join("")}</ol>`);
+          continue;
+        }
+
+        if (/^(\-{3,}|\*{3,}|_{3,})$/.test(trimmed)) {
+          html.push("<hr />");
+          index += 1;
+          continue;
+        }
+
+        const paragraph = [line];
+        index += 1;
+        while (index < lines.length) {
+          const nextLine = lines[index];
+          if (!String(nextLine || "").trim()) break;
+          if (isBlockStart(nextLine)) break;
+          paragraph.push(nextLine);
+          index += 1;
+        }
+        html.push(`<p>${renderInlineMarkdown(paragraph.join("\n").trim())}</p>`);
+      }
+
+      return html.join("\n");
     }
 
     function getSessionTitle(session) {
@@ -4944,8 +5692,8 @@ REMOTE_HTML = r"""<!doctype html>
         card.appendChild(previewHeading);
 
         const preview = document.createElement("div");
-        preview.className = "preview";
-        preview.textContent = progress.last_assistant_text || progress.preview || progress.reason || "最近没有抓到可显示的尾部文本。";
+        preview.className = "preview preview-markdown";
+        preview.innerHTML = renderMarkdown(progress.last_assistant_text || progress.preview || progress.reason || "最近没有抓到可显示的尾部文本。");
         card.appendChild(preview);
 
         const detail = document.createElement("div");
@@ -5143,8 +5891,20 @@ REMOTE_HTML = r"""<!doctype html>
     historyBackdropEl.addEventListener("click", closeHistory);
     targetCloseBtnEl.addEventListener("click", closeTargetEditor);
     targetCancelBtnEl.addEventListener("click", closeTargetEditor);
+    targetDeleteBtnEl.addEventListener("click", () => deleteTargetEditor().then(() => refreshAll()).catch((e) => {
+      targetMetaEl.textContent = e.message || String(e);
+      toast(e.message || String(e), true);
+    }));
     targetBackdropEl.addEventListener("click", closeTargetEditor);
     targetAuthModeEl.addEventListener("change", syncTargetPasswordField);
+    targetCheckBtnEl.addEventListener("click", () => checkTargetEditor().catch((e) => {
+      targetMetaEl.textContent = e.message || String(e);
+      toast(e.message || String(e), true);
+    }));
+    targetBootstrapBtnEl.addEventListener("click", () => bootstrapTargetEditor().then(() => refreshAll()).catch((e) => {
+      targetMetaEl.textContent = e.message || String(e);
+      toast(e.message || String(e), true);
+    }));
     targetSaveBtnEl.addEventListener("click", () => saveTargetEditor().then(() => refreshAll()).catch((e) => {
       targetMetaEl.textContent = e.message || String(e);
       toast(e.message || String(e), true);
@@ -6719,10 +7479,13 @@ INDEX_HTML = r"""<!doctype html>
             <span class="field-help">目标机需要运行 loopback 绑定的 codex_sessions_web 服务。</span>
           </label>
         </div>
-        <div class="history-actions">
-          <button id="targetCancel" type="button">取消</button>
-          <button id="targetSave" type="button" class="primary">保存并测试</button>
-        </div>
+      <div class="history-actions">
+        <button id="targetCancel" type="button">取消</button>
+        <button id="targetDelete" type="button" class="danger">删除机器</button>
+        <button id="targetCheck" type="button">检查远端</button>
+        <button id="targetBootstrap" type="button">部署并保存</button>
+        <button id="targetSave" type="button" class="primary">保存并测试</button>
+      </div>
       </div>
       <div id="toast" class="toast"></div>
     </div>
@@ -6795,6 +7558,9 @@ INDEX_HTML = r"""<!doctype html>
     const targetBaseUrlInputEl = document.getElementById("targetBaseUrlInput");
     const targetCloseEl = document.getElementById("targetClose");
     const targetCancelEl = document.getElementById("targetCancel");
+    const targetDeleteEl = document.getElementById("targetDelete");
+    const targetCheckEl = document.getElementById("targetCheck");
+    const targetBootstrapEl = document.getElementById("targetBootstrap");
     const targetSaveEl = document.getElementById("targetSave");
 	    const guardPanelEl = document.getElementById("guardPanel");
 	    const guardDetailsEl = document.getElementById("guardDetails");
@@ -6826,7 +7592,6 @@ INDEX_HTML = r"""<!doctype html>
     const LIVE_EVENT_WINDOW = 120;
     const LOCAL_TARGET_ID = "local";
     const TARGET_STORAGE_KEY = "codex-target-id";
-    const TARGET_PROFILES_STORAGE_KEY = "codex-target-profiles";
     const TARGET_SECRETS_SESSION_KEY = "codex-target-secrets";
     const SOURCE_PRESETS = [
       {
@@ -6868,51 +7633,11 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     function shouldAttachTarget(path) {
-      return !(path.startsWith("/api/auth/session") || path.startsWith("/api/logout"));
+      return !(path.startsWith("/api/auth/session") || path.startsWith("/api/logout") || path.startsWith("/api/targets"));
     }
 
     function builtinLocalTarget() {
       return { id: LOCAL_TARGET_ID, label: "本机", kind: "local", ssh_host: "", ssh_user: "", ssh_port: 22, base_url: "", auth_mode: "key" };
-    }
-
-    function loadStoredTargetProfiles() {
-      try {
-        const raw = JSON.parse(window.localStorage.getItem(TARGET_PROFILES_STORAGE_KEY) || "[]");
-        if (!Array.isArray(raw)) return [];
-        return raw
-          .filter((item) => item && typeof item === "object")
-          .map((item) => ({
-            id: String(item.id || "").trim(),
-            label: String(item.label || item.id || "").trim(),
-            kind: "ssh",
-            ssh_host: String(item.ssh_host || "").trim(),
-            ssh_user: String(item.ssh_user || "").trim(),
-            ssh_port: Number.parseInt(String(item.ssh_port || "22"), 10) || 22,
-            base_url: String(item.base_url || "http://127.0.0.1:8765").trim() || "http://127.0.0.1:8765",
-            auth_mode: String(item.auth_mode || "key").trim().toLowerCase() === "password" ? "password" : "key",
-          }))
-          .filter((item) => item.id && item.ssh_host && item.ssh_user);
-      } catch (error) {
-        return [];
-      }
-    }
-
-    function saveStoredTargetProfiles(items) {
-      try {
-        const payload = (items || [])
-          .filter((item) => item && item.id !== LOCAL_TARGET_ID)
-          .map((item) => ({
-            id: item.id,
-            label: item.label,
-            ssh_host: item.ssh_host,
-            ssh_user: item.ssh_user,
-            ssh_port: item.ssh_port,
-            base_url: item.base_url,
-            auth_mode: item.auth_mode === "password" ? "password" : "key",
-          }));
-        window.localStorage.setItem(TARGET_PROFILES_STORAGE_KEY, JSON.stringify(payload));
-      } catch (error) {
-      }
     }
 
     function loadStoredTargetSecrets() {
@@ -6998,6 +7723,13 @@ INDEX_HTML = r"""<!doctype html>
       }
     }
 
+    function clearLegacyTargetProfiles() {
+      try {
+        window.localStorage.removeItem("codex-target-profiles");
+      } catch (error) {
+      }
+    }
+
     function currentTargetLabel() {
       const found = targetItems.find((item) => item.id === currentTargetId);
       return found ? String(found.label || found.id || currentTargetId) : currentTargetId;
@@ -7017,9 +7749,35 @@ INDEX_HTML = r"""<!doctype html>
       saveTarget(currentTargetId);
     }
 
+    function normalizeTargetList(items) {
+      if (!Array.isArray(items)) return [];
+      return items
+        .filter((item) => item && typeof item === "object")
+        .map((item) => ({
+          id: String(item.id || "").trim(),
+          label: String(item.label || item.id || "").trim(),
+          kind: String(item.kind || "ssh").trim() || "ssh",
+          ssh_host: String(item.ssh_host || "").trim(),
+          ssh_user: String(item.ssh_user || "").trim(),
+          ssh_port: Number.parseInt(String(item.ssh_port || "22"), 10) || 22,
+          base_url: String(item.base_url || "http://127.0.0.1:8765").trim() || "http://127.0.0.1:8765",
+          auth_mode: String(item.auth_mode || "key").trim().toLowerCase() === "password" ? "password" : "key",
+        }))
+        .filter((item) => item.id);
+    }
+
     async function loadTargets(preserveCurrent = true) {
       targetSecrets = loadStoredTargetSecrets();
-      targetItems = [builtinLocalTarget(), ...loadStoredTargetProfiles()];
+      clearLegacyTargetProfiles();
+      let serverItems = [];
+      try {
+        const data = await api("/api/targets");
+        serverItems = normalizeTargetList(data.targets || []);
+      } catch (error) {
+        serverItems = [builtinLocalTarget()];
+      }
+      if (!serverItems.some((item) => item.id === LOCAL_TARGET_ID)) serverItems.unshift(builtinLocalTarget());
+      targetItems = serverItems;
       const preferred = preserveCurrent ? currentTargetId : loadSavedTarget();
       currentTargetId = targetItems.some((item) => item.id === preferred) ? preferred : LOCAL_TARGET_ID;
       renderTargetOptions();
@@ -7054,6 +7812,7 @@ INDEX_HTML = r"""<!doctype html>
       targetPasswordInputEl.value = activeTarget ? targetPasswordFor(activeTarget.id) : "";
       targetBaseUrlInputEl.value = activeTarget ? String(activeTarget.base_url || "") : "http://127.0.0.1:8765";
       syncTargetPasswordField();
+      targetDeleteEl.style.display = activeTarget && activeTarget.id !== LOCAL_TARGET_ID ? "" : "none";
       targetBackdropEl.style.display = "block";
       targetPanelEl.style.display = "block";
       targetLabelInputEl.focus();
@@ -7062,6 +7821,7 @@ INDEX_HTML = r"""<!doctype html>
 
     function closeTargetEditor() {
       targetEditorOriginalId = "";
+      targetDeleteEl.style.display = "none";
       targetBackdropEl.style.display = "none";
       targetPanelEl.style.display = "none";
       targetMetaEl.textContent = "填写目标机 SSH 信息。密码只保存在当前浏览器会话，不写入持久配置。";
@@ -7107,13 +7867,73 @@ INDEX_HTML = r"""<!doctype html>
       };
     }
 
+    function buildTargetPayload(target, password) {
+      return {
+        label: target.label,
+        ssh_host: target.ssh_host,
+        ssh_user: target.ssh_user,
+        ssh_port: target.ssh_port,
+        base_url: target.base_url,
+        auth_mode: target.auth_mode,
+        ssh_password: password || "",
+      };
+    }
+
+    function describeTargetCheck(data) {
+      const bits = [];
+      if (data.recommendation === "legacy_process_conflict") {
+        bits.push("远端端口被旧手工实例占用，需先清理旧版再接管");
+      } else if (data.recommendation === "port_conflict") {
+        bits.push("远端端口已被占用，新服务无法接管");
+      } else if (data.recommendation === "port_occupied_without_service") {
+        bits.push("远端端口已被其他进程占用");
+      } else if (data.recommendation === "upgrade_required_for_ui") {
+        bits.push("远端已安装，但接口能力不足以支撑当前 UI，需升级");
+      } else if (data.recommendation === "update_recommended") {
+        bits.push("远端 codex_manager 已就绪，但版本落后于当前机器");
+      } else if (data.recommendation === "ready_unknown_version") {
+        bits.push("远端 codex_manager 已就绪，但版本未知");
+      } else if (data.api_ready) {
+        bits.push("远端 codex_manager 已就绪");
+      } else if (data.service_active) {
+        bits.push("服务在跑，但 API 暂不可达");
+      } else if (data.service_installed) {
+        bits.push("远端已安装，但服务未运行");
+      } else {
+        bits.push("远端尚未安装 codex_manager");
+      }
+      bits.push(`sudo: ${data.sudo_ok ? "ok" : "缺失"}`);
+      bits.push(`python3: ${data.python_ok ? "ok" : "缺失"}`);
+      bits.push(`curl: ${data.curl_ok ? "ok" : "缺失"}`);
+      bits.push(`tar: ${data.tar_ok ? "ok" : "缺失"}`);
+      bits.push(`sessions: ${data.compat_sessions ? "ok" : "缺失"}`);
+      bits.push(`remote_sessions: ${data.compat_remote_sessions ? "ok" : "缺失"}`);
+      if (data.compat_session_id) bits.push(`events: ${data.compat_events ? "ok" : "缺失"}`);
+      if (data.listener_pid) bits.push(`占用进程 PID: ${data.listener_pid}`);
+      if (data.listener_command) bits.push(`占用命令: ${data.listener_command}`);
+      if (data.remote_version_label) bits.push(`远端版本: ${data.remote_version_label}`);
+      if (data.local_version_label) bits.push(`当前版本: ${data.local_version_label}`);
+      if (data.api_error) bits.push(`API: ${data.api_error}`);
+      return bits.join(" | ");
+    }
+
     async function saveTargetEditor() {
       const { target, password } = buildTargetDraftFromEditor();
-      targetMetaEl.textContent = `正在测试连接：${target.label || target.id}`;
-      await testTargetConnection(target, password);
-      const stored = loadStoredTargetProfiles().filter((item) => item.id !== target.id && item.id !== targetEditorOriginalId);
-      stored.push(target);
-      saveStoredTargetProfiles(stored);
+      targetMetaEl.textContent = `正在检查远端：${target.label || target.id}`;
+      const check = await api("/api/targets/check", {
+        method: "POST",
+        headers: jsonHeaders(),
+        body: JSON.stringify(buildTargetPayload(target, password))
+      });
+      targetMetaEl.textContent = describeTargetCheck(check);
+      if (!["ready", "ready_unknown_version"].includes(String(check.recommendation || ""))) {
+        throw new Error("远端尚未达到可直接接管状态，请先检查或部署更新");
+      }
+      await api("/api/targets", {
+        method: "POST",
+        headers: jsonHeaders(),
+        body: JSON.stringify(buildTargetPayload(target, password))
+      });
       if (targetEditorOriginalId && targetEditorOriginalId !== target.id) {
         delete targetSecrets[targetEditorOriginalId];
       }
@@ -7128,6 +7948,69 @@ INDEX_HTML = r"""<!doctype html>
       renderTargetOptions();
       closeTargetEditor();
       toast(`已保存机器：${target.label || target.id}`);
+    }
+
+    async function checkTargetEditor() {
+      const { target, password } = buildTargetDraftFromEditor();
+      targetMetaEl.textContent = `正在检查远端：${target.label || target.id}`;
+      const data = await api("/api/targets/check", {
+        method: "POST",
+        headers: jsonHeaders(),
+        body: JSON.stringify(buildTargetPayload(target, password))
+      });
+      targetMetaEl.textContent = describeTargetCheck(data);
+      return data;
+    }
+
+    async function bootstrapTargetEditor() {
+      const { target, password } = buildTargetDraftFromEditor();
+      targetMetaEl.textContent = `正在部署远端：${target.label || target.id}`;
+      const data = await api("/api/targets/bootstrap", {
+        method: "POST",
+        headers: jsonHeaders(),
+        body: JSON.stringify(buildTargetPayload(target, password))
+      });
+      await api("/api/targets", {
+        method: "POST",
+        headers: jsonHeaders(),
+        body: JSON.stringify(buildTargetPayload(target, password))
+      });
+      if (targetEditorOriginalId && targetEditorOriginalId !== target.id) {
+        delete targetSecrets[targetEditorOriginalId];
+      }
+      if (target.auth_mode === "password") {
+        targetSecrets[target.id] = { password };
+      } else {
+        delete targetSecrets[target.id];
+      }
+      saveTargetSecrets();
+      await loadTargets(false);
+      currentTargetId = target.id;
+      renderTargetOptions();
+      closeTargetEditor();
+      toast(data.message || `已部署并保存：${target.label || target.id}`);
+      return data;
+    }
+
+    async function deleteTargetEditor() {
+      const targetId = String(targetEditorOriginalId || "").trim();
+      if (!targetId || targetId === LOCAL_TARGET_ID) return;
+      const target = targetItems.find((item) => item.id === targetId) || currentTarget();
+      if (!confirm(`删除目标机器 ${target.label || targetId} ?`)) return;
+      const data = await api("/api/targets/delete", {
+        method: "POST",
+        headers: jsonHeaders(),
+        body: JSON.stringify({ target: targetId })
+      });
+      delete targetSecrets[targetId];
+      saveTargetSecrets();
+      await loadTargets(false);
+      if (currentTargetId === targetId) {
+        currentTargetId = LOCAL_TARGET_ID;
+        saveTarget(currentTargetId);
+      }
+      closeTargetEditor();
+      toast(data.message || `已删除机器：${target.label || targetId}`);
     }
 
     async function api(path, options = {}, targetOverride = null, passwordOverride = "") {
@@ -9057,8 +9940,20 @@ INDEX_HTML = r"""<!doctype html>
     sourceSaveEl.addEventListener("click", () => saveSourceEditor().catch((e) => toast(e.message, true)));
     targetCloseEl.addEventListener("click", closeTargetEditor);
     targetCancelEl.addEventListener("click", closeTargetEditor);
+    targetDeleteEl.addEventListener("click", () => deleteTargetEditor().then(() => refreshAll()).catch((e) => {
+      targetMetaEl.textContent = e.message || String(e);
+      toast(e.message || String(e), true);
+    }));
     targetBackdropEl.addEventListener("click", closeTargetEditor);
     targetAuthModeEl.addEventListener("change", syncTargetPasswordField);
+    targetCheckEl.addEventListener("click", () => checkTargetEditor().catch((e) => {
+      targetMetaEl.textContent = e.message || String(e);
+      toast(e.message || String(e), true);
+    }));
+    targetBootstrapEl.addEventListener("click", () => bootstrapTargetEditor().then(() => refreshAll()).catch((e) => {
+      targetMetaEl.textContent = e.message || String(e);
+      toast(e.message || String(e), true);
+    }));
     targetSaveEl.addEventListener("click", () => saveTargetEditor().then(() => refreshAll()).catch((e) => {
       targetMetaEl.textContent = e.message || String(e);
       toast(e.message || String(e), true);
