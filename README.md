@@ -1,156 +1,153 @@
 # Codex Manager
 
-`codex_manager` is a local-first supervision console for Codex sessions.
+`codex_manager` 是一个面向 Codex 会话的本地优先监督台。
 
-It is designed for the situation where the hard part is no longer "can an agent do the work?", but "can I reliably watch, steer, and recover several long-running sessions without opening every client and without loading giant session files into memory?".
+它解决的不是“agent 能不能干活”，而是：
 
-[中文说明 / Chinese README](./README.zh-CN.md)
+> “我已经有很多真实的 Codex 会话在跑了，怎么才能稳定地观察、判断、接管、续跑，而不是被一堆客户端和超大的会话文件拖垮？”
 
-## Screenshots
+[English README](./README.en.md)
 
-### Full manager
+## 截图
 
-![Full manager](./docs/screenshots/full-manager.png)
+### 完整页
 
-### Lightweight remote page
+![完整页](./docs/screenshots/full-manager.png)
+
+### 轻量页
 
 <table>
   <tr>
-    <td><img src="./docs/screenshots/remote-mobile-01.png" alt="Remote page - overview" width="320" /></td>
-    <td><img src="./docs/screenshots/remote-mobile-02.png" alt="Remote page - expanded card" width="320" /></td>
+    <td><img src="./docs/screenshots/remote-mobile-01.png" alt="轻量页 - 总览" width="320" /></td>
+    <td><img src="./docs/screenshots/remote-mobile-02.png" alt="轻量页 - 展开状态" width="320" /></td>
   </tr>
 </table>
 
-## What It Is Good At
+## 它最擅长什么
 
-- **Multi-session supervision**
-  - scan many Codex sessions from one page instead of living inside one active thread
-- **Bounded live observation**
-  - recent event windows, commentary, tool calls, tool-output summaries, and completion markers
-  - avoids loading entire giant `.jsonl` transcripts by default
-- **Phone-friendly intervention**
-  - `/remote` lightweight page for watching progress, nudging sessions, and stopping web-triggered resume jobs
-- **Conservative "keep going" automation**
-  - optional `持续推进` mode only resumes after an explicit `task_complete`
-  - no idle-time guessing
-  - single-instance supervisor lock prevents double-running loops
-- **Small-scale multi-machine control**
-  - switch between a few Codex hosts from one control plane
-  - bootstrap a remote host over `ssh + sudo -n` instead of manually babysitting a second checkout
-- **Safer remote operations**
-  - compatibility checks before attaching to a remote host
-  - service/version/API checks before bootstrap or takeover
+- **多会话监督**
+  - 同时扫很多个 Codex 会话，而不是只盯着一个当前对话
+- **有界的实时观察**
+  - 看最近事件窗口、过程说明、工具调用、工具输出摘要、完成标记
+  - 默认不去加载整份超大的 `.jsonl`
+- **适合手机介入**
+  - `/remote` 轻量页可以在离开电脑时看进度、继续推进、停止网页续跑
+- **保守的“持续推进”**
+  - 只在明确出现 `task_complete` 后再继续
+  - 不靠“空闲了几分钟”这种猜测
+  - 有单实例巡检锁，避免双重巡检
+- **小规模多机控制**
+  - 一个控制面切换几台 Codex 主机
+  - 通过 `ssh + sudo -n` 自举远端辅助服务，不用手工长期维护第二份副本
+- **更安全的远端接管**
+  - 接管前先检查远端服务、接口能力和版本是否兼容
 
-## What It Is Not
+## 它不是什么
 
-`codex_manager` is intentionally **not** trying to replace every other Codex-adjacent tool.
+`codex_manager` 并不是想替代所有相关工具。
 
-- It is **not** the best choice when you mainly want one polished active-thread coding UI with diff review and worktree-centric development. The official Codex app is better for that.
-- It is **not** a chat-platform bridge. If your main workflow is Feishu / Slack / Telegram / Discord as the primary control surface, a project like `cc-connect` is a better fit.
-- It is **not** a mobile-first encrypted remote-control product. If your main goal is "take over one live agent from my phone anywhere", a project like `Happy` is more aligned.
+- 如果你主要需要的是**一个主力编码线程的官方体验**，包括 diff review、worktree 驱动的开发流程，那官方 Codex app 更合适。
+- 如果你主要想要的是**手机远程接管一个 agent**，像 [Happy](https://github.com/slopus/happy) 这种产品更贴。
+- 如果你的主入口是**飞书 / Slack / Telegram / Discord / 企业微信** 等聊天平台，那 [cc-connect](https://github.com/chenhg5/cc-connect) 更合适。
 
-This project is optimized for a different problem:
+`codex_manager` 针对的是另一类问题：
 
-> "I already have real Codex sessions running on local or remote machines. I need a bounded, low-drama way to watch them, decide which one needs intervention, and continue them from desktop or phone."
+> “我已经有一批真实会话在本机、WSL 或远端机器上运行，我需要一个低内存、低意外、可观察、可插话的值班台。”
 
-## Where It Stands Relative To Similar Projects
+## 和同类项目相比，强在哪里
 
-| Tool | Best At | Where `codex_manager` Is Different |
+| 工具 | 更擅长什么 | `codex_manager` 的差异 |
 | --- | --- | --- |
-| [OpenAI Codex app](https://openai.com/index/introducing-the-codex-app/) | one active coding thread, diff review, isolated coding workflows, official app-server UX | `codex_manager` is stronger when you want a duty-console view over many existing sessions and a bounded tail-oriented live window |
-| [Happy](https://github.com/slopus/happy) | mobile/web remote control, push notifications, device switching, encrypted remote-mode experience | `codex_manager` does not wrap your CLI usage; it watches existing session artifacts and is better at side-by-side multi-session triage |
-| [cc-connect](https://github.com/chenhg5/cc-connect) | chat-platform bridge for agents across Feishu / Slack / Telegram / Discord / WeChat Work | `codex_manager` is a browser control plane, not a ChatOps bridge; the focus is observability and intervention, not IM integration |
+| [OpenAI Codex app](https://openai.com/index/introducing-the-codex-app/) | 单线程主工作流、官方多智能体体验、diff/worktree 代码工作流 | `codex_manager` 更强在“很多既有会话的监督与值班” |
+| [Happy](https://github.com/slopus/happy) | 手机/Web 远控、推送提醒、跨设备切换、加密远控体验 | `codex_manager` 不要求你用额外包装器启动智能体，更适合观察已经存在的会话资产 |
+| [cc-connect](https://github.com/chenhg5/cc-connect) | 把本地智能体接入聊天平台，做聊天式运维控制 | `codex_manager` 是浏览器控制面，重点是可观察性和介入，不是聊天入口 |
 
-The core differentiators here are:
+这里真正的差异点是：
 
-- **Bounded-memory session observation**
-  - the UI is built around recent event windows and tail reads, not full transcript hydration
-- **Conservative supervision**
-  - explicit `task_complete` handling, not "it has been quiet for a while so maybe resume"
-- **Shared multi-browser control plane**
-  - remote machine definitions live on the server, so desktop and phone see the same target list
-- **Bootstrap instead of manual duplicate setup**
-  - for supported remote machines, the UI can check, deploy, upgrade, and register the remote helper service
+- **避免默认全量吃内存**
+  - 核心界面围绕“最近尾部窗口”和“有界实时观察”，而不是整份对话一次性载入
+- **保守的监督逻辑**
+  - `持续推进` 只在明确完成后接一句，不做模糊猜测
+- **多浏览器共享目标机器**
+  - 远端机器配置存在服务端，不用每个浏览器重新加一遍
+- **远端自举和版本检查**
+  - 不是只会“连”，还会判断能不能安全接管
 
-## Current Product Shape
+## 当前产品形态
 
-`codex_manager` currently has two entrypoints.
+目前主要有两个入口：
 
 - `codex_sessions.py`
-  - CLI for listing, inspecting, renaming, archiving, deleting, and resuming sessions
+  - CLI，负责列会话、看详情、改标题、归档、删除、续跑等
 - `codex_sessions_web.py`
-  - web UI and JSON APIs
-  - full manager at `/`
-  - lightweight mobile page at `/remote`
+  - Web UI + JSON API
+  - 完整页：`/`
+  - 轻量页：`/remote`
 
-### Full Manager: `/`
+### 完整页 `/`
 
-The main page is a two-pane supervision console:
+完整页是一个双栏监督台：
 
-- **left**: fleet list
-  - scan many sessions quickly
-  - see state, recent progress, attention cues, and lightweight metadata
-- **right**: selected-session live console
-  - recent commentary
-  - tool calls
-  - tool-output summaries
-  - token/completion markers
-  - explicit history fetch when needed
+- **左边**：会话总览列表
+  - 快速扫会话
+  - 看状态、最近进展、注意力提示、轻量元数据
+- **右边**：当前会话的实时控制台
+  - 过程说明
+  - 工具调用
+  - 工具输出摘要
+  - token / 完成标记
+  - 真要看历史时再显式加载
 
-It is deliberately **not** a full transcript browser by default.
+重点不是“像聊天软件一样翻完整记录”，而是“判断现在发生了什么”。
 
-### Lightweight Page: `/remote`
+### 轻量页 `/remote`
 
-The lightweight page is designed for phone and tablet use:
+轻量页是手机/平板值班页：
 
-- watched sessions
-- quick filters
-- recent delivery/result preview
-- one-tap continue
-- one-tap stop for web-triggered resume jobs
-- optional `持续推进`
+- 已关注会话
+- 快速筛选
+- 最近交付/结果预览
+- 一键继续
+- 一键停止网页触发的续跑
+- 可选 `持续推进`
 
-`持续推进` is intentionally conservative:
+`持续推进` 的原则是：
 
-- checks every 3 minutes
-- only resumes after explicit `task_complete`
-- records the completed turn it already resumed
-- uses a supervisor lock so only one web instance performs the loop
+- 每 3 分钟检查一次
+- 只在显式 `task_complete` 后接一句
+- 记住已经续跑过的 completed turn
+- 用巡检锁避免两个实例同时巡检
 
-## Remote-Host Model
+## 远端机器模型
 
-The remote model is now:
+远端不是“纯 SSH 生读文件”模式，而是：
 
-- one control-plane machine serves the UI
-- each target machine runs its own loopback-bound `codex_manager` web service
-- the control plane proxies API actions over SSH to that target
+- 控制面机器负责出 UI
+- 每台目标机器各自跑一个只绑定本机回环地址的 `codex_manager`
+- 控制面通过 SSH 代理 API 动作到目标机器
 
-This is intentional. It avoids re-implementing the entire session model over ad-hoc SSH parsing.
+这样做是刻意的。因为一旦你真的需要这些能力：
 
-### Why Not "Raw SSH Only"?
+- 会话列表
+- 最近事件窗口
+- 历史兜底
+- 继续 / 停止
+- 保守的自动续推
+- 兼容性检查
 
-Because once you need all of these reliably:
+直接靠控制面用 SSH 临时解析远端文件，反而更复杂、更脆弱。
 
-- session inventory
-- bounded event windows
-- recent history fallback
-- continue/stop semantics
-- conservative auto-continue
-- compatibility checks
+### 远端自举
 
-...a tiny loopback helper on the target is simpler and more predictable than teaching the control plane to parse everything remotely from scratch.
+如果远端满足：
 
-### Remote Bootstrap
-
-If you have:
-
-- SSH access
+- SSH 可访问
 - `sudo -n true`
 - `python3`
 - `curl`
 - `tar`
 
-then you can bootstrap a remote target from the current local checkout:
+就可以直接从当前本地 checkout 自举：
 
 ```bash
 python codex_sessions_bootstrap.py \
@@ -160,68 +157,68 @@ python codex_sessions_bootstrap.py \
   --bind-port 8765
 ```
 
-The helper will:
+它会自动：
 
-- package the current repository
-- upload it over SSH
-- install it under `~/.local/share/codex_manager`
-- write/update a `systemd` unit
-- start the loopback-bound service on the remote host
-- verify `http://127.0.0.1:<port>/api/remote_sessions`
-- optionally register the target locally
+- 打包当前仓库
+- 通过 SSH 上传
+- 安装到 `~/.local/share/codex_manager`
+- 写/更新 `systemd` 服务
+- 启动远端本机回环服务
+- 验证 `http://127.0.0.1:<port>/api/remote_sessions`
+- 可选写回本机目标配置
 
-The web UI can also:
+Web UI 还可以在部署前先检查：
 
-- check whether a target already has `codex_manager`
-- check whether the service is running
-- verify API compatibility (`sessions`, `remote_sessions`, `events`)
-- compare remote release metadata against the local checkout
+- 远端是否已经装了 `codex_manager`
+- 服务是否已运行
+- API 能力是否齐全（`sessions` / `remote_sessions` / `events`）
+- 远端版本和本地版本是否一致
 
-## Authentication And Exposure Model
+## 认证与暴露模型
 
-The web UI supports optional password auth.
+Web UI 支持本地密码认证。
 
-Typical deployment pattern:
+常见部署方式是：
 
-- direct loopback access can bypass login
-- non-loopback access requires password
-- mutating requests require CSRF protection
+- `127.0.0.1 / localhost` 直连可绕过登录
+- 非本机回环访问必须登录
+- 变更类 API 带 CSRF 保护
 
-Example local URLs:
+示例本地地址：
 
 - `http://127.0.0.1:8765/`
 - `http://127.0.0.1:8765/remote`
 
-On this machine, the service is often exposed to the LAN with:
+在这台机器上的常见实际部署方式：
 
-- loopback bypass for local use
-- password required for LAN / tunnel access
-- LAN-only firewall rules on the Linux side
-- matching WSL / Hyper-V port allow rules on Windows
+- 本机回环免密
+- 局域网 / 隧道访问需要密码
+- Linux 侧限制为仅局域网访问
+- Windows 侧配对应的 WSL/Hyper-V 放行规则
 
-## Repository Layout
+## 仓库结构
 
 - `codex_sessions.py`
-  - CLI entrypoint
+  - CLI 入口
 - `codex_sessions_web.py`
-  - web UI, APIs, remote proxying, supervision logic
+  - Web 界面、API、远端代理、监督逻辑
 - `codex_sessions_bootstrap.py`
-  - SSH + sudo remote bootstrap / upgrade helper
+  - `ssh + sudo` 远端自举 / 升级辅助脚本
 - `codex_manager_release.py`
-  - release metadata and version comparison helpers
+  - 发布元数据和版本比较辅助
 - `test_codex_sessions_web.py`
-  - web/API behavior tests
+  - Web/API 行为测试
 
-## Quick Start
+## 快速开始
 
-Run from the repository root:
+在仓库根目录执行：
 
 ```bash
 uv run python codex_sessions.py --help
 uv run python codex_sessions_web.py --help
 ```
 
-Typical CLI usage:
+常见 CLI 用法：
 
 ```bash
 uv run python codex_sessions.py list --limit 20
@@ -235,26 +232,26 @@ uv run python codex_sessions.py resume <session-id> --non-interactive --prompt "
 uv run python codex_sessions.py paths
 ```
 
-Start the web UI:
+启动 Web UI：
 
 ```bash
 uv run python codex_sessions_web.py --host 127.0.0.1 --port 8765
 ```
 
-Then open:
+打开：
 
 - `http://127.0.0.1:8765/`
 - `http://127.0.0.1:8765/remote`
 
-## Main Routes And APIs
+## 主要路由与 API
 
-Main routes:
+主页面：
 
 - `GET /`
 - `GET /remote`
 - `GET /login`
 
-Read APIs:
+读取类 API：
 
 - `GET /api/sessions`
 - `GET /api/history`
@@ -264,7 +261,7 @@ Read APIs:
 - `GET /api/progress`
 - `GET /api/targets`
 
-Mutating APIs:
+变更类 API：
 
 - `POST /api/continue`
 - `POST /api/stop`
@@ -277,15 +274,15 @@ Mutating APIs:
 - `POST /api/targets`
 - `POST /api/targets/delete`
 
-Compatibility aliases still exist:
+兼容别名仍然保留：
 
 - `POST /api/rename` -> `POST /api/set_title`
 - `POST /api/unname` -> `POST /api/clear_title`
 - `POST /api/set_cwd` -> `POST /api/set_workdir`
 
-## Development
+## 开发
 
-Basic checks:
+基础检查：
 
 ```bash
 python -m py_compile \
@@ -298,11 +295,11 @@ python -m py_compile \
 python -m unittest test_codex_sessions_web.py
 ```
 
-## Version Control Notes
+## 版本控制说明
 
-Some deployments are plain Git repos. Some are colocated `jj + git`. Some are runtime copies without either.
+有些部署是普通 Git 仓库；有些是 `jj + git`；还有些只是运行时副本。
 
-Check what you actually have before assuming workflow:
+先看清楚当前目录是什么：
 
 ```bash
 git status
@@ -311,7 +308,7 @@ jj status
 
 ## License
 
-Apache-2.0. See [LICENSE](./LICENSE).
+Apache-2.0，见 [LICENSE](./LICENSE)。
 
 ## Star History
 
