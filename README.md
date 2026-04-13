@@ -105,7 +105,7 @@ The lightweight page is designed for phone and tablet use:
 
 - watched sessions
 - quick filters
-- recent 3-round context fallback
+- recent delivery/result preview
 - one-tap continue
 - one-tap stop for web-triggered resume jobs
 - optional `持续推进`
