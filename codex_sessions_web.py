@@ -4922,6 +4922,7 @@ REMOTE_HTML = r"""<!doctype html>
     let targetSecrets = {};
     let targetEditorOriginalId = "";
     const expandedPreviewKeys = new Set();
+    const previewScrollOffsets = new Map();
 
     function toast(text, isError = false) {
       toastEl.textContent = text;
@@ -5039,6 +5040,19 @@ REMOTE_HTML = r"""<!doctype html>
       const alive = new Set((items || []).map((session) => previewStateKey(session)));
       for (const key of Array.from(expandedPreviewKeys)) {
         if (!alive.has(key)) expandedPreviewKeys.delete(key);
+      }
+      for (const key of Array.from(previewScrollOffsets.keys())) {
+        if (!alive.has(key)) previewScrollOffsets.delete(key);
+      }
+    }
+
+    function capturePreviewScrollOffsets() {
+      const previews = Array.from(cardsEl.querySelectorAll(".preview[data-preview-key]"));
+      for (const preview of previews) {
+        if (preview.classList.contains("is-collapsed")) continue;
+        const key = String(preview.dataset.previewKey || "").trim();
+        if (!key) continue;
+        previewScrollOffsets.set(key, preview.scrollTop || 0);
       }
     }
 
@@ -5765,6 +5779,7 @@ REMOTE_HTML = r"""<!doctype html>
         progress.auto_continue_enabled = Boolean(session.auto_continue);
         const card = document.createElement("div");
         card.className = "card";
+        card.dataset.sessionId = session.id || "";
         if (session.watched) card.classList.add("watched");
 
         const head = document.createElement("div");
@@ -5822,10 +5837,11 @@ REMOTE_HTML = r"""<!doctype html>
         card.appendChild(previewHeading);
 
         const previewText = String(progress.last_assistant_text || progress.preview || progress.reason || "最近没有抓到可显示的尾部文本。");
+        const previewKey = previewStateKey(session);
         const preview = document.createElement("div");
         preview.className = "preview preview-markdown";
+        preview.dataset.previewKey = previewKey;
         preview.innerHTML = renderMarkdown(previewText);
-        const previewKey = previewStateKey(session);
         const shouldCollapsePreview =
           String(progress.attention_state || "") === "completed" ||
           previewText.length > 280;
@@ -5841,13 +5857,26 @@ REMOTE_HTML = r"""<!doctype html>
             const collapsed = preview.classList.toggle("is-collapsed");
             if (collapsed) {
               expandedPreviewKeys.delete(previewKey);
+              previewScrollOffsets.set(previewKey, preview.scrollTop || 0);
             } else {
               expandedPreviewKeys.add(previewKey);
+              requestAnimationFrame(() => {
+                preview.scrollTop = Number(previewScrollOffsets.get(previewKey) || 0);
+              });
             }
             previewToggle.textContent = collapsed ? "展开内容" : "收起内容";
           });
           previewActions.appendChild(previewToggle);
           card.appendChild(previewActions);
+        }
+        preview.addEventListener("scroll", () => {
+          if (preview.classList.contains("is-collapsed")) return;
+          previewScrollOffsets.set(previewKey, preview.scrollTop || 0);
+        }, { passive: true });
+        if (!preview.classList.contains("is-collapsed")) {
+          requestAnimationFrame(() => {
+            preview.scrollTop = Number(previewScrollOffsets.get(previewKey) || 0);
+          });
         }
 
         const detail = document.createElement("div");
@@ -5909,7 +5938,43 @@ REMOTE_HTML = r"""<!doctype html>
       }
     }
 
+    function captureViewportAnchor() {
+      const cards = Array.from(cardsEl.querySelectorAll(".card[data-session-id]"));
+      const fallbackY = window.scrollY || window.pageYOffset || 0;
+      for (const card of cards) {
+        const rect = card.getBoundingClientRect();
+        if (rect.bottom <= 0) continue;
+        if (rect.top >= window.innerHeight) break;
+        const absoluteTop = fallbackY + rect.top;
+        return {
+          type: "card",
+          sessionId: String(card.dataset.sessionId || ""),
+          delta: fallbackY - absoluteTop,
+          fallbackY,
+        };
+      }
+      return { type: "scroll", sessionId: "", delta: 0, fallbackY };
+    }
+
+    function restoreViewportAnchor(anchor) {
+      if (!anchor) return;
+      if (anchor.type === "card" && anchor.sessionId) {
+        const selector = `.card[data-session-id="${CSS.escape(String(anchor.sessionId))}"]`;
+        const card = cardsEl.querySelector(selector);
+        if (card) {
+          const currentY = window.scrollY || window.pageYOffset || 0;
+          const absoluteTop = currentY + card.getBoundingClientRect().top;
+          const targetY = Math.max(0, absoluteTop + Number(anchor.delta || 0));
+          window.scrollTo(0, targetY);
+          return;
+        }
+      }
+      window.scrollTo(0, Math.max(0, Number(anchor.fallbackY || 0)));
+    }
+
     async function loadRemote() {
+      const anchor = captureViewportAnchor();
+      capturePreviewScrollOffsets();
       const query = encodeURIComponent(qEl.value.trim());
       const limit = encodeURIComponent(limitEl.value);
       const data = await api(`/api/remote_sessions?q=${query}&limit=${limit}`);
@@ -5917,6 +5982,7 @@ REMOTE_HTML = r"""<!doctype html>
       remoteWatchlistCount = Number(data.watchlist_count || 0);
       remoteAutoContinueCount = Number(data.auto_continue_count || 0);
       renderRemote();
+      requestAnimationFrame(() => restoreViewportAnchor(anchor));
     }
 
     async function loadGuard() {
