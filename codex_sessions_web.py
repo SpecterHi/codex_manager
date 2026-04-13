@@ -2894,7 +2894,7 @@ class SessionHandler(BaseHTTPRequestHandler):
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <title>Codex Sessions Login</title>
   <style>
     :root {{
@@ -4162,8 +4162,12 @@ REMOTE_HTML = r"""<!doctype html>
         radial-gradient(circle at top left, rgba(15, 118, 110, 0.08), transparent 28%),
         linear-gradient(180deg, #eef5ff 0%, #f7f9fc 100%);
       color: var(--text);
+      overflow-x: hidden;
+      -webkit-text-size-adjust: 100%;
+      text-size-adjust: 100%;
     }
     .wrap {
+      width: min(100%, 860px);
       max-width: 860px;
       margin: 0 auto;
       padding: 16px;
@@ -4174,23 +4178,28 @@ REMOTE_HTML = r"""<!doctype html>
       gap: 12px;
       align-items: flex-start;
       margin-bottom: 12px;
+      min-width: 0;
     }
+    .hero > * { min-width: 0; }
     .hero h1 {
       margin: 0;
       font-size: 22px;
       line-height: 1.15;
+      overflow-wrap: anywhere;
     }
     .hero p {
       margin: 6px 0 0;
       color: var(--muted);
       font-size: 14px;
       line-height: 1.45;
+      overflow-wrap: anywhere;
     }
     .hero-actions {
       display: flex;
       gap: 8px;
       flex-wrap: wrap;
       justify-content: flex-end;
+      min-width: 0;
     }
     .panel {
       background: var(--panel);
@@ -4198,6 +4207,7 @@ REMOTE_HTML = r"""<!doctype html>
       border-radius: 18px;
       box-shadow: var(--shadow);
       padding: 14px;
+      min-width: 0;
     }
     .guard-panel {
       margin-bottom: 12px;
@@ -4255,7 +4265,7 @@ REMOTE_HTML = r"""<!doctype html>
       border: 1px solid var(--line);
       border-radius: 12px;
       padding: 10px 12px;
-      font-size: 14px;
+      font-size: 16px;
       background: #fff;
       color: var(--text);
     }
@@ -4319,6 +4329,7 @@ REMOTE_HTML = r"""<!doctype html>
       display: grid;
       gap: 12px;
       margin-top: 12px;
+      min-width: 0;
     }
     .card {
       border: 1px solid var(--line);
@@ -4326,6 +4337,7 @@ REMOTE_HTML = r"""<!doctype html>
       padding: 14px;
       background:
         linear-gradient(180deg, rgba(255,255,255,0.98) 0%, rgba(248,250,252,0.94) 100%);
+      min-width: 0;
     }
     .card.watched {
       border-color: #99f6e4;
@@ -4338,11 +4350,14 @@ REMOTE_HTML = r"""<!doctype html>
       justify-content: space-between;
       gap: 10px;
       align-items: flex-start;
+      min-width: 0;
     }
+    .card-head > * { min-width: 0; }
     .title {
       margin: 0;
       font-size: 17px;
       line-height: 1.3;
+      overflow-wrap: anywhere;
     }
     .subhead {
       margin-top: 4px;
@@ -4350,6 +4365,7 @@ REMOTE_HTML = r"""<!doctype html>
       font-size: 12px;
       line-height: 1.45;
       word-break: break-word;
+      overflow-wrap: anywhere;
     }
     .chips {
       display: flex;
@@ -4418,11 +4434,27 @@ REMOTE_HTML = r"""<!doctype html>
       line-height: 1.55;
       white-space: pre-wrap;
       word-break: break-word;
-      max-height: min(34vh, 20rem);
+      overflow-wrap: anywhere;
+      max-height: min(54vh, 30rem);
       overflow: auto;
       overscroll-behavior: contain;
       -webkit-overflow-scrolling: touch;
       scrollbar-gutter: stable both-edges;
+      position: relative;
+    }
+    .preview.is-collapsed {
+      max-height: min(18vh, 8.75rem);
+      overflow: hidden;
+    }
+    .preview.is-collapsed::after {
+      content: "";
+      position: absolute;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      height: 40px;
+      background: linear-gradient(180deg, rgba(248,250,252,0) 0%, rgba(248,250,252,0.96) 100%);
+      pointer-events: none;
     }
     .preview.preview-markdown {
       white-space: normal;
@@ -4444,6 +4476,7 @@ REMOTE_HTML = r"""<!doctype html>
       background: #0f172a;
       color: #e2e8f0;
       overflow: auto;
+      max-width: 100%;
       font-size: 12px;
       line-height: 1.5;
     }
@@ -4470,6 +4503,12 @@ REMOTE_HTML = r"""<!doctype html>
       margin: 10px 0;
     }
     .preview.preview-markdown a { color: #0f766e; text-decoration: underline; }
+    .preview.preview-markdown table {
+      display: block;
+      max-width: 100%;
+      overflow-x: auto;
+      border-collapse: collapse;
+    }
     .preview-label {
       margin-top: 12px;
       color: var(--muted);
@@ -4483,6 +4522,19 @@ REMOTE_HTML = r"""<!doctype html>
       font-size: 12px;
       line-height: 1.45;
     }
+    .preview-actions {
+      margin-top: 8px;
+      display: flex;
+      justify-content: flex-end;
+    }
+    .preview-toggle {
+      padding: 7px 10px;
+      border-radius: 999px;
+      font-size: 12px;
+      line-height: 1;
+      background: #f8fafc;
+      color: var(--muted);
+    }
     .detail {
       margin-top: 10px;
       display: grid;
@@ -4490,6 +4542,8 @@ REMOTE_HTML = r"""<!doctype html>
       color: var(--muted);
       font-size: 13px;
       line-height: 1.45;
+      min-width: 0;
+      overflow-wrap: anywhere;
     }
     .detail strong {
       color: var(--text);
@@ -4508,6 +4562,8 @@ REMOTE_HTML = r"""<!doctype html>
     .mono {
       font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
       font-size: 12px;
+      overflow-wrap: anywhere;
+      word-break: break-word;
     }
     .empty {
       padding: 20px 8px;
@@ -4614,6 +4670,7 @@ REMOTE_HTML = r"""<!doctype html>
       .wrap { padding: 12px; }
       .hero { flex-direction: column; }
       .hero-actions { justify-content: flex-start; }
+      .hero-actions > * { width: 100%; }
       .card-head { flex-direction: column; }
       .chips { justify-content: flex-start; }
       button, input, select { width: 100%; }
@@ -4625,7 +4682,8 @@ REMOTE_HTML = r"""<!doctype html>
         padding: 12px;
       }
       .history-body { max-height: calc(100vh - 210px); }
-      .preview { max-height: min(40vh, 18rem); }
+      .preview { max-height: min(58vh, 34rem); }
+      .preview.is-collapsed { max-height: min(16vh, 6.75rem); }
       .target-form-grid {
         grid-template-columns: 1fr;
       }
@@ -4798,6 +4856,7 @@ REMOTE_HTML = r"""<!doctype html>
     let currentTargetId = LOCAL_TARGET_ID;
     let targetSecrets = {};
     let targetEditorOriginalId = "";
+    const expandedPreviewKeys = new Set();
 
     function toast(text, isError = false) {
       toastEl.textContent = text;
@@ -4905,6 +4964,17 @@ REMOTE_HTML = r"""<!doctype html>
     function currentTargetLabel() {
       const found = targetItems.find((item) => item.id === currentTargetId);
       return found ? String(found.label || found.id || currentTargetId) : currentTargetId;
+    }
+
+    function previewStateKey(session) {
+      return `${currentTargetId}::${String(session.id || "").trim()}`;
+    }
+
+    function syncExpandedPreviewKeys(items) {
+      const alive = new Set((items || []).map((session) => previewStateKey(session)));
+      for (const key of Array.from(expandedPreviewKeys)) {
+        if (!alive.has(key)) expandedPreviewKeys.delete(key);
+      }
     }
 
     function renderTargetOptions() {
@@ -5612,6 +5682,7 @@ REMOTE_HTML = r"""<!doctype html>
     }
 
     function renderCards(items) {
+      syncExpandedPreviewKeys(items);
       cardsEl.innerHTML = "";
       if (!items.length) {
         const empty = document.createElement("div");
@@ -5660,16 +5731,7 @@ REMOTE_HTML = r"""<!doctype html>
         tools.className = "actions";
         tools.appendChild(button(session.watched ? "取消关注" : "加入关注", session.watched ? "watch-active" : "soft", () => toggleWatch(session)));
         tools.appendChild(button(session.auto_continue ? CONTINUOUS_STOP_LABEL : CONTINUOUS_ENTER_LABEL, session.auto_continue ? "danger" : "primary", () => toggleAutoContinue(session)));
-        tools.appendChild(button("最近 3 轮", "", () => viewHistory(session)));
         if (progress.remote_running) tools.appendChild(button("停止续跑", "danger", () => stopContinue(session)));
-        tools.appendChild(button("复制 ID", "", async () => {
-          try {
-            await navigator.clipboard.writeText(session.id);
-            toast(`已复制 session id: ${session.id}`);
-          } catch (error) {
-            toast(error.message || String(error), true);
-          }
-        }));
         controls.appendChild(tools);
 
         if (!["running", "queued"].includes(String(progress.state || ""))) {
@@ -5691,10 +5753,34 @@ REMOTE_HTML = r"""<!doctype html>
         previewHeading.textContent = progressPreviewLabel(progress);
         card.appendChild(previewHeading);
 
+        const previewText = String(progress.last_assistant_text || progress.preview || progress.reason || "最近没有抓到可显示的尾部文本。");
         const preview = document.createElement("div");
         preview.className = "preview preview-markdown";
-        preview.innerHTML = renderMarkdown(progress.last_assistant_text || progress.preview || progress.reason || "最近没有抓到可显示的尾部文本。");
+        preview.innerHTML = renderMarkdown(previewText);
+        const previewKey = previewStateKey(session);
+        const shouldCollapsePreview =
+          String(progress.attention_state || "") === "completed" ||
+          previewText.length > 280;
+        const previewExpanded = expandedPreviewKeys.has(previewKey);
+        if (shouldCollapsePreview && !previewExpanded) {
+          preview.classList.add("is-collapsed");
+        }
         card.appendChild(preview);
+        if (shouldCollapsePreview) {
+          const previewActions = document.createElement("div");
+          previewActions.className = "preview-actions";
+          const previewToggle = button(previewExpanded ? "收起内容" : "展开内容", "preview-toggle", () => {
+            const collapsed = preview.classList.toggle("is-collapsed");
+            if (collapsed) {
+              expandedPreviewKeys.delete(previewKey);
+            } else {
+              expandedPreviewKeys.add(previewKey);
+            }
+            previewToggle.textContent = collapsed ? "展开内容" : "收起内容";
+          });
+          previewActions.appendChild(previewToggle);
+          card.appendChild(previewActions);
+        }
 
         const detail = document.createElement("div");
         detail.className = "detail";
