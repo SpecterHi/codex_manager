@@ -8,6 +8,18 @@
 
 [English README](./README.md)
 
+## 截图
+
+### 完整页
+
+![完整页](./docs/screenshots/full-manager.png)
+
+### 轻量页
+
+![轻量页 - 总览](./docs/screenshots/remote-mobile-01.png)
+
+![轻量页 - 展开状态](./docs/screenshots/remote-mobile-02.png)
+
 ## 它最擅长什么
 
 - **多会话监督**

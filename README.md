@@ -6,6 +6,18 @@ It is designed for the situation where the hard part is no longer "can an agent 
 
 [中文说明 / Chinese README](./README.zh-CN.md)
 
+## Screenshots
+
+### Full manager
+
+![Full manager](./docs/screenshots/full-manager.png)
+
+### Lightweight remote page
+
+![Remote page - overview](./docs/screenshots/remote-mobile-01.png)
+
+![Remote page - expanded card](./docs/screenshots/remote-mobile-02.png)
+
 ## What It Is Good At
 
 - **Multi-session supervision**
