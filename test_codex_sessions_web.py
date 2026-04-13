@@ -80,6 +80,7 @@ class SessionEventsTest(unittest.TestCase):
                     "compat_remote_sessions": True,
                     "compat_events": True,
                     "compat_session_id": "sess-1",
+                    "codex_ok": True,
                     "release_metadata": dict(local_release),
                 },
                 repo_root,
@@ -100,12 +101,32 @@ class SessionEventsTest(unittest.TestCase):
                     "compat_remote_sessions": True,
                     "compat_events": True,
                     "compat_session_id": "sess-1",
+                    "codex_ok": True,
                     "release_metadata": {"content_digest": "deadbeef" * 8, "git_commit_short": "old1234"},
                 },
                 repo_root,
             )
             self.assertFalse(result["version_match"])
             self.assertEqual(result["recommendation"], "update_recommended")
+
+    def test_enrich_target_check_result_marks_resume_unavailable_without_codex(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            (repo_root / "codex_sessions_web.py").write_text("print('ok')\n", encoding="utf-8")
+            result = web.enrich_target_check_result(
+                {
+                    "ok": True,
+                    "api_ready": True,
+                    "compat_sessions": True,
+                    "compat_remote_sessions": True,
+                    "compat_events": True,
+                    "compat_session_id": "sess-1",
+                    "codex_ok": False,
+                    "release_metadata": dict(web.build_release_metadata(repo_root)),
+                },
+                repo_root,
+            )
+            self.assertEqual(result["recommendation"], "resume_unavailable")
 
     def test_enrich_target_check_result_requires_upgrade_when_capability_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -229,6 +250,19 @@ class SessionEventsTest(unittest.TestCase):
             self.assertEqual(len(delta), 1)
             self.assertEqual(delta[0]["kind"], "tool_output")
             self.assertGreaterEqual(next_cursor, cursor)
+
+    def test_resolve_codex_bin_uses_local_candidates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir)
+            fake_bin = home / ".local" / "bin" / "codex"
+            fake_bin.parent.mkdir(parents=True, exist_ok=True)
+            fake_bin.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            fake_bin.chmod(0o755)
+            with mock.patch.object(web.Path, "home", return_value=home), mock.patch.object(
+                web, "discover_vscode_codex_bins", return_value=[]
+            ), mock.patch.object(web.shutil, "which", return_value=None):
+                resolved = web.resolve_codex_bin("codex")
+            self.assertEqual(resolved, str(fake_bin))
 
     def test_commentary_and_assistant_duplicates_are_collapsed(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

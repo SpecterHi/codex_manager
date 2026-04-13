@@ -317,6 +317,46 @@ command -v tar >/dev/null
         raise SystemExit(f"Remote sudo/python/curl check failed: {stderr or exc}") from exc
 
 
+def detect_remote_codex_bin(spec: RemoteSpec, extra_options: Iterable[str], password: str) -> str:
+    script = r"""set -euo pipefail
+python3 - <<'PY'
+import json
+import os
+import shutil
+from glob import glob
+
+direct = shutil.which("codex")
+if direct:
+    print(json.dumps({"codex_bin": direct}, ensure_ascii=False))
+    raise SystemExit(0)
+
+candidates = [
+    os.path.expanduser("~/.local/bin/codex"),
+    os.path.expanduser("~/.npm-global/bin/codex"),
+    os.path.expanduser("~/bin/codex"),
+]
+candidates.extend(sorted(glob(os.path.expanduser("~/.vscode-server/extensions/openai.chatgpt-*/bin/linux-x86_64/codex")), reverse=True))
+candidates.extend(sorted(glob(os.path.expanduser("~/.vscode-server-insiders/extensions/openai.chatgpt-*/bin/linux-x86_64/codex")), reverse=True))
+for candidate in candidates:
+    if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+        print(json.dumps({"codex_bin": candidate}, ensure_ascii=False))
+        raise SystemExit(0)
+
+print(json.dumps({"codex_bin": ""}, ensure_ascii=False))
+PY
+"""
+    try:
+        result = run_remote(spec, extra_options, script, password=password)
+    except subprocess.CalledProcessError as exc:
+        stderr = exc.stderr.decode("utf-8", errors="replace").strip()
+        raise SystemExit(f"Failed to detect remote codex binary: {stderr or exc}") from exc
+    try:
+        payload = json.loads(result.stdout.decode("utf-8", errors="replace").strip())
+    except Exception as exc:
+        raise SystemExit(f"Failed to parse remote codex payload: {exc}") from exc
+    return str(payload.get("codex_bin") or "").strip()
+
+
 def install_remote_release(
     spec: RemoteSpec,
     extra_options: Iterable[str],
@@ -324,6 +364,7 @@ def install_remote_release(
     archive_path: Path,
     *,
     release_metadata: dict[str, Any],
+    remote_codex_bin: str,
     password: str,
 ) -> None:
     stamp = iso_stamp()
@@ -354,7 +395,8 @@ Group={remote_identity.group}
 WorkingDirectory={base_abs}/current
 Environment=PYTHONUNBUFFERED=1
 Environment=CODEX_HOME={codex_home_abs}
-ExecStart={base_abs}/current/codex_sessions_web.sh --host {spec.bind_host} --port {spec.bind_port} --codex-home {codex_home_abs}
+Environment=PATH={remote_identity.home}/.local/bin:{remote_identity.home}/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart={base_abs}/current/codex_sessions_web.sh --host {spec.bind_host} --port {spec.bind_port} --codex-home {codex_home_abs}{f" --codex-bin {remote_codex_bin}" if remote_codex_bin else ""}
 Restart=on-failure
 RestartSec=2
 
@@ -497,6 +539,8 @@ def main() -> int:
         print(
             f"[bootstrap] remote identity: user={remote_identity.user} group={remote_identity.group} home={remote_identity.home}"
         )
+        remote_codex_bin = detect_remote_codex_bin(spec, args.ssh_option, ssh_password)
+        print(f"[bootstrap] remote codex: {remote_codex_bin or '(not found; runtime fallback will try)'}")
         print(f"[bootstrap] installing release to {spec.remote_base} and enabling {spec.service_name}")
         install_remote_release(
             spec,
@@ -504,6 +548,7 @@ def main() -> int:
             remote_identity,
             archive_path,
             release_metadata=release_metadata,
+            remote_codex_bin=remote_codex_bin,
             password=ssh_password,
         )
         print(f"[bootstrap] verifying remote API on {spec.base_url}")

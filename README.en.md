@@ -40,6 +40,7 @@ It is designed for the situation where the hard part is no longer "can an agent 
 - **Safer remote operations**
   - compatibility checks before attaching to a remote host
   - service/version/API checks before bootstrap or takeover
+  - resume checks also verify that the remote host has a usable `codex` binary
 
 ## What It Is Not
 
@@ -176,6 +177,41 @@ The web UI can also:
 - check whether the service is running
 - verify API compatibility (`sessions`, `remote_sessions`, `events`)
 - compare remote release metadata against the local checkout
+
+### What The Remote `codex` Requirement Really Means
+
+Remote resume and conservative keep-going mode need more than the helper service itself: the target must also have a real executable `codex`.
+
+Current priority order:
+
+1. **Best path: Codex CLI is installed on the remote host and available in the non-interactive PATH**
+2. **Compatibility path: Linux / WSL target has no standalone Codex CLI, but does have the VS Code Server extension**
+   - the current build probes:
+     - `~/.local/bin/codex`
+     - `~/.npm-global/bin/codex`
+     - `~/bin/codex`
+     - `~/.vscode-server/extensions/openai.chatgpt-*/bin/linux-x86_64/codex`
+     - `~/.vscode-server-insiders/extensions/openai.chatgpt-*/bin/linux-x86_64/codex`
+   - in other words, **on Linux / WSL, a remote host can currently reuse the `codex` binary shipped inside the VS Code Server extension**
+3. **If neither exists**
+   - list/watch operations may still work
+   - but resume / keep-going will be marked unavailable during the check phase
+
+### Current Remote Support Boundaries
+
+| Scenario | Current status | Notes |
+| --- | --- | --- |
+| Linux + systemd + `codex` in PATH | fully supported | the recommended and least surprising setup |
+| Linux + systemd + only VS Code Server `codex` | supported | verified in practice for remote resume |
+| WSL + systemd + `codex` in PATH | fully supported | verified in practice |
+| WSL + systemd + only VS Code Server `codex` | supported | verified in practice |
+| remote macOS host | not supported by the same bootstrap path yet | current bootstrap writes `systemd` units and does not implement `launchd` or VS Code-for-mac binary discovery |
+| remote native Windows host | not supported by the same bootstrap path yet | current bootstrap assumes `ssh + sudo + systemd` and does not implement Windows service management or binary discovery |
+
+So the precise statement today is:
+
+- **remote bootstrap / takeover / resume are currently designed and validated for Linux and systemd-enabled WSL**
+- **macOS and Windows are not claimed as equivalent remote targets yet**
 
 ## Authentication And Exposure Model
 

@@ -41,6 +41,7 @@
   - 通过 `ssh + sudo -n` 自举远端辅助服务，不用手工长期维护第二份副本
 - **更安全的远端接管**
   - 接管前先检查远端服务、接口能力和版本是否兼容
+  - 续跑前还会检查远端到底有没有可用的 `codex` 可执行文件
 
 ## 它不是什么
 
@@ -173,6 +174,41 @@ Web UI 还可以在部署前先检查：
 - 服务是否已运行
 - API 能力是否齐全（`sessions` / `remote_sessions` / `events`）
 - 远端版本和本地版本是否一致
+
+### 远端 `codex` 依赖到底是什么
+
+远端要能“继续推进 / 持续推进”，除了 `codex_manager` 自己，还必须能找到一个真实可执行的 `codex`。
+
+当前优先级是：
+
+1. **最佳路径：远端已安装 Codex CLI，并且在非交互环境的 PATH 里**
+2. **兼容路径：Linux / WSL 远端没有独立 Codex CLI，但装了 VS Code 扩展**
+   - 当前版本会额外探测：
+     - `~/.local/bin/codex`
+     - `~/.npm-global/bin/codex`
+     - `~/bin/codex`
+     - `~/.vscode-server/extensions/openai.chatgpt-*/bin/linux-x86_64/codex`
+     - `~/.vscode-server-insiders/extensions/openai.chatgpt-*/bin/linux-x86_64/codex`
+   - 也就是说，**在 Linux / WSL 上，远端可以不单独再装一份 Codex CLI，直接复用 VS Code Server 扩展里的 `codex`**
+3. **如果以上都没有**
+   - 列表和只读观察仍可能可用
+   - 但“继续推进 / 持续推进”会被检查阶段直接判成不可用
+
+### 当前远端支持边界
+
+| 场景 | 当前状态 | 说明 |
+| --- | --- | --- |
+| Linux + systemd + `codex` 在 PATH | 完整支持 | 最推荐，也是最稳的标准形态 |
+| Linux + systemd + 只有 VS Code Server 扩展里的 `codex` | 支持 | 当前已实际验证，可用于续跑 |
+| WSL + systemd + `codex` 在 PATH | 完整支持 | 当前已实际验证 |
+| WSL + systemd + 只有 VS Code Server 扩展里的 `codex` | 支持 | 当前已实际验证 |
+| macOS 远端 | 暂不支持同样的自举路径 | 当前 bootstrap 写的是 `systemd` unit，也没有实现 macOS 的 `launchd` 和 VS Code for mac 的二进制探测 |
+| Windows 原生远端 | 暂不支持同样的自举路径 | 当前 bootstrap 依赖 `ssh + sudo + systemd`，也没有实现 Windows 侧服务托管和二进制探测 |
+
+所以当前要说准一点：
+
+- **远端自举 / 远端接管 / 远端续跑，目前明确支持的是 Linux 和启用了 systemd 的 WSL**
+- **macOS / Windows 不是完全不能跑 `codex_manager`，而是当前这套“检查 + 自举 + 续跑依赖探测”的远端管理链路还没有专门适配**
 
 ## 认证与暴露模型
 

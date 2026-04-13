@@ -34,6 +34,7 @@ from codex_sessions import (
     choose_display_title,
     clear_session_overrides,
     describe_source,
+    discover_vscode_codex_bins,
     display_path,
     find_record,
     filter_records,
@@ -207,6 +208,7 @@ import subprocess
 import urllib.error
 import urllib.parse
 import urllib.request
+from glob import glob
 from pathlib import Path
 
 request_args = REQUEST
@@ -229,6 +231,33 @@ def capture(command):
     return completed.stdout.strip()
 
 
+def detect_codex_bin():
+    direct = shutil.which("codex")
+    if direct:
+        return direct
+    candidates = [
+        os.path.expanduser("~/.local/bin/codex"),
+        os.path.expanduser("~/.npm-global/bin/codex"),
+        os.path.expanduser("~/bin/codex"),
+    ]
+    candidates.extend(
+        sorted(
+            glob(os.path.expanduser("~/.vscode-server/extensions/openai.chatgpt-*/bin/linux-x86_64/codex")),
+            reverse=True,
+        )
+    )
+    candidates.extend(
+        sorted(
+            glob(os.path.expanduser("~/.vscode-server-insiders/extensions/openai.chatgpt-*/bin/linux-x86_64/codex")),
+            reverse=True,
+        )
+    )
+    for candidate in candidates:
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return ""
+
+
 result = {
     "ok": True,
     "service_name": service_name,
@@ -238,7 +267,9 @@ result = {
     "python_ok": shutil.which("python3") is not None,
     "curl_ok": shutil.which("curl") is not None,
     "tar_ok": shutil.which("tar") is not None,
+    "codex_bin": detect_codex_bin(),
 }
+result["codex_ok"] = bool(result["codex_bin"])
 result["sudo_ok"] = ok(["sudo", "-n", "true"])
 result["service_installed"] = False
 result["service_enabled"] = False
@@ -357,7 +388,7 @@ if result["api_ready"]:
 if result["api_ready"] and result["compat_sessions"] and result["compat_remote_sessions"] and (
     result["compat_events"] or not result["compat_session_id"]
 ):
-    result["recommendation"] = "ready"
+    result["recommendation"] = "ready" if result["codex_ok"] else "resume_unavailable"
 elif result["service_active"]:
     result["recommendation"] = "service_running_but_api_unreachable"
 elif result["service_installed"] and result["port_in_use"] and not result["listener_matches_expected_release"]:
@@ -1078,6 +1109,34 @@ def compact_preview(text: str, limit: int = 180) -> str:
     return cleaned[: max(0, limit - 1)].rstrip() + "…"
 
 
+def resolve_codex_bin(preferred: str) -> Optional[str]:
+    candidates: list[str] = []
+    text = str(preferred or "").strip()
+    if text:
+        candidates.append(text)
+    candidates.extend(
+        [
+            str(Path.home() / ".local" / "bin" / "codex"),
+            str(Path.home() / ".npm-global" / "bin" / "codex"),
+            str(Path.home() / "bin" / "codex"),
+        ]
+    )
+    candidates.extend(discover_vscode_codex_bins())
+    for candidate in candidates:
+        raw = str(candidate or "").strip()
+        if not raw:
+            continue
+        expanded = os.path.expanduser(raw)
+        if os.path.isabs(expanded):
+            if os.path.isfile(expanded) and os.access(expanded, os.X_OK):
+                return expanded
+            continue
+        resolved = shutil.which(expanded)
+        if resolved:
+            return resolved
+    return None
+
+
 def b64url_encode(raw: bytes) -> str:
     return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
 
@@ -1387,7 +1446,9 @@ def enrich_target_check_result(result: Dict[str, Any], repo_root: Path) -> Dict[
     if str(result.get("recommendation") or "") in {"legacy_process_conflict", "port_conflict", "port_occupied_without_service"}:
         return result
     if result.get("api_ready") and is_compatible:
-        if version_match is True:
+        if not result.get("codex_ok"):
+            result["recommendation"] = "resume_unavailable"
+        elif version_match is True:
             result["recommendation"] = "ready"
         elif version_match is False:
             result["recommendation"] = "update_recommended"
@@ -1865,8 +1926,12 @@ def launch_resume_for_record(
     safe_origin = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in str(origin_label or "web")).strip("_") or "web"
     log_path = log_dir / f"{started_at.replace(':', '-')}--{safe_origin}--{record.session_id}.log"
     log_handle = log_path.open("ab")
+    resolved_codex_bin = resolve_codex_bin(app.codex_bin)
+    if not resolved_codex_bin:
+        log_handle.close()
+        return None, cwd_path, log_path, None, "Failed to launch resume command: could not locate a usable codex binary"
     cmd = [
-        app.codex_bin,
+        resolved_codex_bin,
         "exec",
         "resume",
         "--skip-git-repo-check",
@@ -5129,6 +5194,8 @@ REMOTE_HTML = r"""<!doctype html>
         bits.push("远端端口已被占用，新服务无法接管");
       } else if (data.recommendation === "port_occupied_without_service") {
         bits.push("远端端口已被其他进程占用");
+      } else if (data.recommendation === "resume_unavailable") {
+        bits.push("远端界面可用，但续跑不可用");
       } else if (data.recommendation === "upgrade_required_for_ui") {
         bits.push("远端已安装，但接口能力不足以支撑当前 UI，需升级");
       } else if (data.recommendation === "update_recommended") {
@@ -5148,6 +5215,7 @@ REMOTE_HTML = r"""<!doctype html>
       bits.push(`python3: ${data.python_ok ? "ok" : "缺失"}`);
       bits.push(`curl: ${data.curl_ok ? "ok" : "缺失"}`);
       bits.push(`tar: ${data.tar_ok ? "ok" : "缺失"}`);
+      bits.push(`续跑: ${data.codex_ok ? "ok" : "缺少 codex"}`);
       bits.push(`sessions: ${data.compat_sessions ? "ok" : "缺失"}`);
       bits.push(`remote_sessions: ${data.compat_remote_sessions ? "ok" : "缺失"}`);
       if (data.compat_session_id) bits.push(`events: ${data.compat_events ? "ok" : "缺失"}`);
@@ -7973,6 +8041,8 @@ INDEX_HTML = r"""<!doctype html>
         bits.push("远端端口已被占用，新服务无法接管");
       } else if (data.recommendation === "port_occupied_without_service") {
         bits.push("远端端口已被其他进程占用");
+      } else if (data.recommendation === "resume_unavailable") {
+        bits.push("远端界面可用，但续跑不可用");
       } else if (data.recommendation === "upgrade_required_for_ui") {
         bits.push("远端已安装，但接口能力不足以支撑当前 UI，需升级");
       } else if (data.recommendation === "update_recommended") {
@@ -7992,6 +8062,7 @@ INDEX_HTML = r"""<!doctype html>
       bits.push(`python3: ${data.python_ok ? "ok" : "缺失"}`);
       bits.push(`curl: ${data.curl_ok ? "ok" : "缺失"}`);
       bits.push(`tar: ${data.tar_ok ? "ok" : "缺失"}`);
+      bits.push(`续跑: ${data.codex_ok ? "ok" : "缺少 codex"}`);
       bits.push(`sessions: ${data.compat_sessions ? "ok" : "缺失"}`);
       bits.push(`remote_sessions: ${data.compat_remote_sessions ? "ok" : "缺失"}`);
       if (data.compat_session_id) bits.push(`events: ${data.compat_events ? "ok" : "缺失"}`);
