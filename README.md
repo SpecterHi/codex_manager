@@ -14,9 +14,12 @@ It is designed for the situation where the hard part is no longer "can an agent 
 
 ### Lightweight remote page
 
-![Remote page - overview](./docs/screenshots/remote-mobile-01.png)
-
-![Remote page - expanded card](./docs/screenshots/remote-mobile-02.png)
+<table>
+  <tr>
+    <td><img src="./docs/screenshots/remote-mobile-01.png" alt="Remote page - overview" width="320" /></td>
+    <td><img src="./docs/screenshots/remote-mobile-02.png" alt="Remote page - expanded card" width="320" /></td>
+  </tr>
+</table>
 
 ## What It Is Good At
 

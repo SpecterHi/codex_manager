@@ -16,9 +16,12 @@
 
 ### 轻量页
 
-![轻量页 - 总览](./docs/screenshots/remote-mobile-01.png)
-
-![轻量页 - 展开状态](./docs/screenshots/remote-mobile-02.png)
+<table>
+  <tr>
+    <td><img src="./docs/screenshots/remote-mobile-01.png" alt="轻量页 - 总览" width="320" /></td>
+    <td><img src="./docs/screenshots/remote-mobile-02.png" alt="轻量页 - 展开状态" width="320" /></td>
+  </tr>
+</table>
 
 ## 它最擅长什么
 
