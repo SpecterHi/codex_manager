@@ -31,14 +31,19 @@ from typing import Any, Dict, Optional
 from urllib.parse import parse_qs, quote, urlencode, urlparse
 
 from codex_sessions import (
+    active_session_path,
+    archived_session_path,
     choose_display_title,
     clear_session_overrides,
+    deleted_session_path,
     describe_source,
     discover_vscode_codex_bins,
     display_path,
     find_record,
     filter_records,
     load_records,
+    move_session_record,
+    session_record_state,
     set_session_cwd,
     set_session_source,
     set_session_title,
@@ -163,7 +168,9 @@ PROXYABLE_POST_PATHS = {
     "/api/set_cwd",
     "/api/set_source",
     "/api/archive",
+    "/api/unarchive",
     "/api/delete",
+    "/api/restore",
     "/api/batch_archive",
     "/api/batch_delete",
     "/api/resume_cmd",
@@ -495,6 +502,7 @@ def as_session_item(record: Any) -> Dict[str, Any]:
         "effort": record.effort,
         "session_size_bytes": int(getattr(record, "session_size_bytes", 0) or 0),
         "archived": bool(record.archived),
+        "deleted": bool(getattr(record, "deleted", False)),
         "slack_threads": list(record.slack_threads),
         "updated_at": updated_at,
         "updated_at_epoch_ms": updated_at_epoch_ms,
@@ -581,8 +589,9 @@ def build_stats(app: AppContext, include_archived: bool, query: str, source_labe
     with_slack = sum(1 for record in records if record.slack_threads)
     return {
         "total": len(records),
-        "active": sum(1 for record in records if not record.archived),
+        "active": sum(1 for record in records if not record.archived and not getattr(record, "deleted", False)),
         "archived": sum(1 for record in records if record.archived),
+        "deleted": sum(1 for record in records if getattr(record, "deleted", False)),
         "with_alias": with_alias,
         "with_slack_thread": with_slack,
         "top_originator": originator.most_common(5),
@@ -3514,8 +3523,14 @@ class SessionHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/archive":
             self._handle_archive(payload)
             return
+        if parsed.path == "/api/unarchive":
+            self._handle_unarchive(payload)
+            return
         if parsed.path == "/api/delete":
             self._handle_delete(payload)
+            return
+        if parsed.path == "/api/restore":
+            self._handle_restore(payload)
             return
         if parsed.path == "/api/batch_archive":
             self._handle_batch_archive(payload)
@@ -3764,13 +3779,14 @@ class SessionHandler(BaseHTTPRequestHandler):
                 self._send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": str(exc)})
                 return
 
+            if getattr(record, "deleted", False):
+                self._send_json(HTTPStatus.CONFLICT, {"ok": False, "error": "Deleted session must be restored first"})
+                return
             if record.archived:
                 self._send_json(HTTPStatus.OK, {"ok": True, "message": "Already archived"})
                 return
 
-            dst_dir = self.app.codex_home / "archived_sessions"
-            dst_dir.mkdir(parents=True, exist_ok=True)
-            dst_path = dst_dir / record.path.name
+            dst_path = archived_session_path(self.app.codex_home, record)
             if dst_path.exists():
                 self._send_json(
                     HTTPStatus.CONFLICT,
@@ -3778,13 +3794,57 @@ class SessionHandler(BaseHTTPRequestHandler):
                 )
                 return
 
-            shutil.move(str(record.path), str(dst_path))
+            move_session_record(record, dst_path)
 
         self._send_json(
             HTTPStatus.OK,
             {
                 "ok": True,
                 "message": "Archived",
+                "session_id": record.session_id,
+            },
+        )
+
+    def _handle_unarchive(self, payload: Dict[str, Any]) -> None:
+        session_key = str(payload.get("session", "")).strip()
+        if not session_key:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "Missing `session`"})
+            return
+
+        with self.app.lock:
+            records = load_records(
+                codex_home=self.app.codex_home,
+                include_archived=True,
+                slack_db=self.app.slack_db,
+                aliases_db=self.app.aliases_db,
+            )
+            try:
+                record = find_record(records, session_key)
+            except ValueError as exc:
+                self._send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": str(exc)})
+                return
+            if getattr(record, "deleted", False):
+                self._send_json(HTTPStatus.CONFLICT, {"ok": False, "error": "Deleted session must be restored, not unarchived"})
+                return
+            if not record.archived:
+                self._send_json(HTTPStatus.OK, {"ok": True, "message": "Session is not archived"})
+                return
+
+            dst_path = active_session_path(self.app.codex_home, record)
+            if dst_path.exists():
+                self._send_json(
+                    HTTPStatus.CONFLICT,
+                    {"ok": False, "error": f"Restore target exists: {display_path(dst_path)}"},
+                )
+                return
+
+            move_session_record(record, dst_path)
+
+        self._send_json(
+            HTTPStatus.OK,
+            {
+                "ok": True,
+                "message": "Unarchived",
                 "session_id": record.session_id,
             },
         )
@@ -3812,14 +3872,66 @@ class SessionHandler(BaseHTTPRequestHandler):
                 self._send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": str(exc)})
                 return
 
-            record.path.unlink(missing_ok=False)
-            clear_session_overrides(self.app.aliases_db, record.session_id)
+            if getattr(record, "deleted", False):
+                self._send_json(HTTPStatus.OK, {"ok": True, "message": "Already deleted", "session_id": record.session_id})
+                return
+
+            dst_path = deleted_session_path(self.app.codex_home, record)
+            if dst_path.exists():
+                self._send_json(
+                    HTTPStatus.CONFLICT,
+                    {"ok": False, "error": f"Delete target exists: {display_path(dst_path)}"},
+                )
+                return
+
+            move_session_record(record, dst_path)
 
         self._send_json(
             HTTPStatus.OK,
             {
                 "ok": True,
-                "message": "Deleted",
+                "message": "Soft-deleted",
+                "session_id": record.session_id,
+            },
+        )
+
+    def _handle_restore(self, payload: Dict[str, Any]) -> None:
+        session_key = str(payload.get("session", "")).strip()
+        if not session_key:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "Missing `session`"})
+            return
+
+        with self.app.lock:
+            records = load_records(
+                codex_home=self.app.codex_home,
+                include_archived=True,
+                slack_db=self.app.slack_db,
+                aliases_db=self.app.aliases_db,
+            )
+            try:
+                record = find_record(records, session_key)
+            except ValueError as exc:
+                self._send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": str(exc)})
+                return
+            if not getattr(record, "deleted", False):
+                self._send_json(HTTPStatus.OK, {"ok": True, "message": "Session is not deleted"})
+                return
+
+            dst_path = active_session_path(self.app.codex_home, record)
+            if dst_path.exists():
+                self._send_json(
+                    HTTPStatus.CONFLICT,
+                    {"ok": False, "error": f"Restore target exists: {display_path(dst_path)}"},
+                )
+                return
+
+            move_session_record(record, dst_path)
+
+        self._send_json(
+            HTTPStatus.OK,
+            {
+                "ok": True,
+                "message": "Restored",
                 "session_id": record.session_id,
             },
         )
@@ -3851,14 +3963,16 @@ class SessionHandler(BaseHTTPRequestHandler):
                     results.append({"session": session_key, "status": "not_found", "error": str(exc)})
                     continue
 
+                if getattr(record, "deleted", False):
+                    conflict += 1
+                    results.append({"session": record.session_id, "status": "deleted", "error": "restore it before archiving"})
+                    continue
                 if record.archived:
                     skipped_archived += 1
                     results.append({"session": record.session_id, "status": "already_archived", "error": ""})
                     continue
 
-                dst_dir = self.app.codex_home / "archived_sessions"
-                dst_dir.mkdir(parents=True, exist_ok=True)
-                dst_path = dst_dir / record.path.name
+                dst_path = archived_session_path(self.app.codex_home, record)
                 if dst_path.exists():
                     conflict += 1
                     results.append(
@@ -3870,7 +3984,7 @@ class SessionHandler(BaseHTTPRequestHandler):
                     )
                     continue
 
-                shutil.move(str(record.path), str(dst_path))
+                move_session_record(record, dst_path)
                 archived_count += 1
                 results.append({"session": record.session_id, "status": "archived", "error": ""})
 
@@ -3900,7 +4014,8 @@ class SessionHandler(BaseHTTPRequestHandler):
         results: list[Dict[str, str]] = []
         deleted_count = 0
         not_found = 0
-        file_missing = 0
+        conflict = 0
+        already_deleted = 0
 
         with self.app.lock:
             records = load_records(
@@ -3916,15 +4031,18 @@ class SessionHandler(BaseHTTPRequestHandler):
                     not_found += 1
                     results.append({"session": session_key, "status": "not_found", "error": str(exc)})
                     continue
-                try:
-                    record.path.unlink(missing_ok=False)
-                except FileNotFoundError:
-                    file_missing += 1
+                if getattr(record, "deleted", False):
+                    already_deleted += 1
+                    results.append({"session": record.session_id, "status": "already_deleted", "error": ""})
+                    continue
+                dst_path = deleted_session_path(self.app.codex_home, record)
+                if dst_path.exists():
+                    conflict += 1
                     results.append(
-                        {"session": record.session_id, "status": "missing_file", "error": "session file not found"}
+                        {"session": record.session_id, "status": "conflict", "error": f"Delete target exists: {display_path(dst_path)}"}
                     )
                     continue
-                clear_session_overrides(self.app.aliases_db, record.session_id)
+                move_session_record(record, dst_path)
                 deleted_count += 1
                 results.append({"session": record.session_id, "status": "deleted", "error": ""})
 
@@ -3935,7 +4053,8 @@ class SessionHandler(BaseHTTPRequestHandler):
                 "requested": len(session_keys),
                 "deleted": deleted_count,
                 "not_found": not_found,
-                "missing_file": file_missing,
+                "already_deleted": already_deleted,
+                "conflict": conflict,
                 "results": results,
             },
         )
@@ -3956,6 +4075,9 @@ class SessionHandler(BaseHTTPRequestHandler):
                 record = find_record(records, session_key)
             except ValueError as exc:
                 self._send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": str(exc)})
+                return
+            if getattr(record, "deleted", False):
+                self._send_json(HTTPStatus.CONFLICT, {"ok": False, "error": "Deleted session must be restored before resuming"})
                 return
         self._send_json(
             HTTPStatus.OK,
@@ -3992,6 +4114,9 @@ class SessionHandler(BaseHTTPRequestHandler):
                 record = find_record(records, session_key)
             except ValueError as exc:
                 self._send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": str(exc)})
+                return
+            if getattr(record, "deleted", False):
+                self._send_json(HTTPStatus.CONFLICT, {"ok": False, "error": "Deleted session must be restored before continuing"})
                 return
 
             existing, cwd_path, log_path, exit_code, error = launch_resume_for_record(
@@ -6185,14 +6310,14 @@ INDEX_HTML = r"""<!doctype html>
         linear-gradient(180deg, #eef3fb 0%, #f8fafc 45%, #f7f9fc 100%);
       color: var(--text);
     }
-    .wrap { max-width: 1840px; margin: 0 auto; padding: 20px; }
+    .wrap { max-width: 1760px; margin: 0 auto; padding: 20px; }
     .panel {
       background: linear-gradient(180deg, rgba(255,255,255,0.98) 0%, rgba(248,250,252,0.96) 100%);
       border: 1px solid var(--line);
       border-radius: 24px;
       padding: 18px;
-      box-shadow: var(--shadow);
-      backdrop-filter: blur(14px);
+      box-shadow: 0 18px 44px rgba(15, 23, 42, 0.08);
+      backdrop-filter: blur(12px);
     }
     .intro-grid {
       display: grid;
@@ -6231,7 +6356,7 @@ INDEX_HTML = r"""<!doctype html>
     }
     .page-subtitle {
       margin: 6px 0 0;
-      max-width: 760px;
+      max-width: 820px;
       color: var(--muted);
       font-size: 13px;
       line-height: 1.5;
@@ -6337,23 +6462,23 @@ INDEX_HTML = r"""<!doctype html>
     }
     .toolbar-shell {
       display: grid;
-      gap: 10px;
+      gap: 8px;
     }
     .toolbar-row {
       display: flex;
       flex-wrap: wrap;
-      gap: 10px;
+      gap: 8px;
     }
     .toolbar-block {
       display: flex;
       flex-wrap: wrap;
-      gap: 10px;
+      gap: 8px;
       align-items: center;
-      padding: 10px 12px;
-      border: 1px solid var(--line);
-      border-radius: 16px;
-      background: linear-gradient(180deg, rgba(255,255,255,0.92) 0%, rgba(245,248,252,0.94) 100%);
-      box-shadow: inset 0 1px 0 rgba(255,255,255,0.85);
+      padding: 9px 10px;
+      border: 1px solid rgba(203, 213, 225, 0.7);
+      border-radius: 14px;
+      background: rgba(255,255,255,0.72);
+      box-shadow: none;
     }
     .toolbar-block.grow-block {
       flex: 1 1 720px;
@@ -6362,7 +6487,7 @@ INDEX_HTML = r"""<!doctype html>
       flex: 1 1 320px;
     }
     .toolbar-label {
-      font-size: 11px;
+      font-size: 10px;
       font-weight: 700;
       letter-spacing: 0.08em;
       text-transform: uppercase;
@@ -6371,12 +6496,12 @@ INDEX_HTML = r"""<!doctype html>
     .grow { flex: 1 1 360px; min-width: 240px; }
     input, select, button {
       border: 1px solid var(--line);
-      border-radius: 14px;
+      border-radius: 12px;
       padding: 10px 12px;
       font-size: 14px;
       background: white;
       color: var(--text);
-      min-height: 42px;
+      min-height: 40px;
     }
     label.toggle {
       display: inline-flex;
@@ -6384,9 +6509,9 @@ INDEX_HTML = r"""<!doctype html>
       gap: 8px;
       padding: 10px 12px;
       border: 1px solid var(--line);
-      border-radius: 14px;
+      border-radius: 12px;
       background: #fff;
-      min-height: 42px;
+      min-height: 40px;
     }
     label.toggle input {
       margin: 0;
@@ -6412,7 +6537,7 @@ INDEX_HTML = r"""<!doctype html>
       background: var(--accent);
       color: white;
       border-color: var(--accent);
-      box-shadow: 0 10px 22px rgba(15, 118, 110, 0.18);
+      box-shadow: 0 8px 18px rgba(15, 118, 110, 0.14);
     }
     button.warn {
       color: var(--warn);
@@ -6433,12 +6558,12 @@ INDEX_HTML = r"""<!doctype html>
     .status-pill {
       display: flex;
       align-items: center;
-      min-height: 40px;
-      padding: 8px 12px;
-      border: 1px solid var(--line);
-      border-radius: 16px;
-      background: var(--panel-soft);
-      box-shadow: inset 0 1px 0 rgba(255,255,255,0.88);
+      min-height: 36px;
+      padding: 7px 10px;
+      border: 1px solid rgba(203, 213, 225, 0.72);
+      border-radius: 14px;
+      background: rgba(255,255,255,0.72);
+      box-shadow: none;
     }
     .status-pill.hint {
       color: var(--accent);
@@ -6598,19 +6723,20 @@ INDEX_HTML = r"""<!doctype html>
     }
     .action-stack {
       display: grid;
-      gap: 10px;
+      gap: 8px;
       min-width: 0;
-      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      grid-template-columns: 1fr;
     }
     .action-group {
       display: grid;
-      gap: 8px;
-      min-height: 100%;
-      padding: 12px;
-      border: 1px solid var(--line);
-      border-radius: 18px;
-      background: linear-gradient(180deg, rgba(255,255,255,0.96) 0%, rgba(246,249,252,0.92) 100%);
-      box-shadow: inset 0 1px 0 rgba(255,255,255,0.92);
+      grid-template-columns: 84px minmax(0, 1fr);
+      gap: 10px;
+      align-items: start;
+      padding: 10px 12px;
+      border: 1px solid rgba(148, 163, 184, 0.16);
+      border-radius: 14px;
+      background: rgba(255,255,255,0.9);
+      box-shadow: none;
     }
     .action-group-label {
       font-size: 11px;
@@ -6618,18 +6744,18 @@ INDEX_HTML = r"""<!doctype html>
       letter-spacing: 0.08em;
       text-transform: uppercase;
       color: var(--muted);
+      line-height: 1.35;
+      padding-top: 4px;
     }
     .action-group-body {
-      display: grid;
-      gap: 6px;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      align-content: start;
-    }
-    .action-group-body.single {
-      grid-template-columns: 1fr;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+      min-width: 0;
     }
     .action-group-body button {
-      width: 100%;
+      width: auto;
       min-height: 36px;
       padding: 8px 10px;
       font-size: 12px;
@@ -6676,10 +6802,10 @@ INDEX_HTML = r"""<!doctype html>
     }
     .session-detail-panel {
       border: 1px solid var(--line);
-      border-radius: 18px;
+      border-radius: 16px;
       padding: 12px;
-      background: linear-gradient(180deg, rgba(255,255,255,0.94) 0%, rgba(248,250,252,0.92) 100%);
-      box-shadow: inset 0 1px 0 rgba(255,255,255,0.92);
+      background: rgba(250,252,255,0.92);
+      box-shadow: none;
     }
     .session-detail-head {
       display: flex;
@@ -6703,8 +6829,15 @@ INDEX_HTML = r"""<!doctype html>
     }
     .session-detail-layout {
       display: grid;
-      gap: 10px;
+      gap: 12px;
       margin-top: 10px;
+      grid-template-columns: 1fr;
+      align-items: start;
+    }
+    .session-detail-sidebar,
+    .session-detail-main {
+      display: grid;
+      gap: 10px;
     }
     .session-utility-row {
       display: flex;
@@ -6712,15 +6845,38 @@ INDEX_HTML = r"""<!doctype html>
       gap: 8px;
     }
     .session-utility-row button {
-      min-height: 34px;
-      padding: 7px 10px;
+      min-height: 0;
+      padding: 0;
       font-size: 12px;
-      border-radius: 12px;
+      border-radius: 0;
+    }
+    .utility-link {
+      min-height: 0;
+      padding: 0;
+      border: 0;
+      background: transparent;
+      box-shadow: none;
+      color: var(--accent);
+      font-size: 12px;
+      font-weight: 600;
+      line-height: 1.4;
+    }
+    .utility-link:hover {
+      transform: none;
+      box-shadow: none;
+      text-decoration: underline;
     }
     .session-context-grid {
       display: grid;
       gap: 10px;
       grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    }
+    .session-detail-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 10px;
+      align-items: center;
     }
     .session-detail-grid {
       display: grid;
@@ -6806,6 +6962,10 @@ INDEX_HTML = r"""<!doctype html>
       padding: 10px 12px;
       background: rgba(255,255,255,0.82);
     }
+    .info-tile.subtle {
+      border-color: rgba(148, 163, 184, 0.14);
+      background: rgba(248,250,252,0.72);
+    }
     .info-label {
       font-size: 11px;
       font-weight: 700;
@@ -6819,6 +6979,9 @@ INDEX_HTML = r"""<!doctype html>
       line-height: 1.5;
       color: var(--text);
       word-break: break-word;
+    }
+    .info-tile.subtle .info-value {
+      color: var(--muted);
     }
     .session-card-actions {
       margin-top: 14px;
@@ -7117,9 +7280,12 @@ INDEX_HTML = r"""<!doctype html>
 	      display: none;
 	    }
 	    .session-layout {
-	      grid-template-columns: minmax(430px, 520px) minmax(0, 1fr);
+	      grid-template-columns: minmax(400px, 468px) minmax(0, 1fr);
 	      align-items: start;
 	      justify-content: start;
+	      max-width: 1660px;
+	      margin: 0 auto;
+	      gap: 16px;
 	    }
 	    .session-cards {
 	      display: grid;
@@ -7131,24 +7297,34 @@ INDEX_HTML = r"""<!doctype html>
 	      scrollbar-gutter: stable;
 	    }
 	    .fleet-card {
-	      border: 1px solid var(--line);
+	      position: relative;
+	      overflow: hidden;
+	      border: 1px solid rgba(203, 213, 225, 0.82);
 	      border-radius: 16px;
 	      padding: 12px;
-	      background: linear-gradient(180deg, rgba(255,255,255,0.96) 0%, rgba(246,249,252,0.9) 100%);
-	      box-shadow: inset 0 1px 0 rgba(255,255,255,0.9);
+	      background: rgba(255,255,255,0.97);
+	      box-shadow: 0 4px 14px rgba(15, 23, 42, 0.035);
 	      cursor: pointer;
 	      transition: border-color 140ms ease, box-shadow 140ms ease, transform 140ms ease;
 	      min-width: 0;
 	    }
 	    .fleet-card:hover {
 	      transform: translateY(-1px);
-	      border-color: #8dd3c7;
-	      box-shadow: 0 10px 22px rgba(15, 23, 42, 0.07);
+	      border-color: rgba(153, 246, 228, 0.92);
+	      box-shadow: 0 10px 22px rgba(15, 23, 42, 0.06);
 	    }
 	    .fleet-card.active {
-	      border-color: #14b8a6;
-	      box-shadow: 0 12px 24px rgba(20, 184, 166, 0.14);
-	      background: linear-gradient(180deg, rgba(240,253,250,0.98) 0%, rgba(245,255,253,0.94) 100%);
+	      border-color: rgba(45, 212, 191, 0.38);
+	      box-shadow: 0 14px 28px rgba(15, 23, 42, 0.075);
+	      background: rgba(255,255,255,0.99);
+	    }
+	    .fleet-card.active::before {
+	      content: "";
+	      position: absolute;
+	      inset: 10px auto 10px 0;
+	      width: 3px;
+	      border-radius: 999px;
+	      background: linear-gradient(180deg, rgba(20,184,166,0.95) 0%, rgba(45,212,191,0.55) 100%);
 	    }
 	    .fleet-card-head {
 	      display: flex;
@@ -7163,7 +7339,11 @@ INDEX_HTML = r"""<!doctype html>
 	    .fleet-card-title {
 	      margin: 0;
 	      font-size: 14px;
-	      line-height: 1.35;
+	      line-height: 1.32;
+	      letter-spacing: -0.01em;
+	    }
+	    .fleet-card.active .fleet-card-title {
+	      color: #0f172a;
 	    }
 	    .fleet-card-updated {
 	      font-size: 12px;
@@ -7190,7 +7370,13 @@ INDEX_HTML = r"""<!doctype html>
 	    }
 	    .fleet-card-footer {
 	      margin-top: 8px;
+	      display: grid;
+	      gap: 8px;
+	      min-width: 0;
+	    }
+	    .fleet-card-footer-row {
 	      display: flex;
+	      flex-wrap: wrap;
 	      gap: 8px;
 	      align-items: center;
 	      justify-content: space-between;
@@ -7232,7 +7418,6 @@ INDEX_HTML = r"""<!doctype html>
 	      background: linear-gradient(180deg, rgba(255,255,255,0.98) 0%, rgba(245,248,252,0.96) 100%);
 	      min-height: calc(100vh - 250px);
 	      width: 100%;
-	      max-width: 1040px;
 	      display: grid;
 	      grid-template-rows: auto auto 1fr auto;
 	      overflow: hidden;
@@ -7270,12 +7455,36 @@ INDEX_HTML = r"""<!doctype html>
 	      align-items: center;
 	    }
 	    .live-actions {
-	      padding: 10px 20px;
+	      padding: 12px 20px;
 	      border-bottom: 1px solid var(--line);
+	      display: grid;
+	      gap: 10px;
+	      background: rgba(250,252,255,0.9);
+	    }
+	    .live-actions-head {
+	      display: flex;
+	      align-items: center;
+	      justify-content: space-between;
+	      gap: 12px;
+	      flex-wrap: wrap;
+	    }
+	    .live-actions-title {
+	      font-size: 11px;
+	      font-weight: 700;
+	      letter-spacing: 0.08em;
+	      text-transform: uppercase;
+	      color: var(--muted);
+	    }
+	    .live-actions-note {
+	      font-size: 12px;
+	      color: var(--muted);
+	      line-height: 1.45;
+	    }
+	    .live-actions-body {
 	      display: flex;
 	      flex-wrap: wrap;
-	      gap: 6px;
-	      background: rgba(250,252,255,0.86);
+	      gap: 8px;
+	      align-items: center;
 	    }
 	    .live-actions .status-pill {
 	      min-height: 34px;
@@ -7440,23 +7649,79 @@ INDEX_HTML = r"""<!doctype html>
 	    }
 	    .composer-actions {
 	      display: flex;
-	      flex-wrap: wrap;
+	      gap: 12px;
+	      align-items: center;
+	      flex-wrap: nowrap;
+	      overflow-x: auto;
+	      padding-bottom: 2px;
+	    }
+	    .composer-group {
+	      display: flex;
 	      gap: 8px;
 	      align-items: center;
+	      min-width: 0;
+	      padding: 0;
+	      border: 0;
+	      border-radius: 0;
+	      background: transparent;
+	      flex: 1 1 0;
 	    }
-	    .composer-actions button {
-	      min-height: 38px;
-	      padding: 8px 12px;
+	    .composer-group.primary-group {
+	      background: transparent;
+	      border-color: transparent;
+	      flex: 1.15 1 0;
+	    }
+	    .composer-group-title {
+	      font-size: 11px;
+	      font-weight: 700;
+	      letter-spacing: 0.08em;
+	      text-transform: uppercase;
+	      color: var(--muted);
+	      white-space: nowrap;
+	    }
+	    .composer-group-body {
+	      display: flex;
+	      gap: 6px;
+	      flex-wrap: nowrap;
+	      min-width: 0;
+	    }
+	    .composer-group.primary-group .composer-group-body {
+	      min-width: 0;
+	    }
+	    .composer-group-body button {
+	      min-height: 34px;
+	      padding: 7px 10px;
 	      border-radius: 12px;
 	      font-size: 12px;
+	      white-space: nowrap;
 	    }
 	    .live-note {
 	      font-size: 12px;
 	      color: var(--muted);
 	      line-height: 1.5;
 	    }
+	    @media (max-width: 1660px) {
+	      .composer-actions {
+	        flex-wrap: wrap;
+	        overflow: visible;
+	        align-items: stretch;
+	      }
+	      .composer-group {
+	        flex: 1 1 calc(50% - 6px);
+	        align-items: flex-start;
+	      }
+	      .composer-group.primary-group {
+	        flex: 1 1 100%;
+	      }
+	      .composer-group-body {
+	        flex-wrap: wrap;
+	      }
+	    }
 	    @media (max-width: 960px) {
 	      .session-layout {
+	        grid-template-columns: 1fr;
+	      }
+	      .session-detail-layout {
 	        grid-template-columns: 1fr;
 	      }
 	      .session-cards {
@@ -7467,6 +7732,37 @@ INDEX_HTML = r"""<!doctype html>
 	      }
 	      .live-events {
 	        max-height: none;
+	      }
+	      .composer-actions {
+	        display: grid;
+	        gap: 10px;
+	        overflow: visible;
+	      }
+	      .composer-group,
+	      .composer-group.primary-group {
+	        display: grid;
+	        gap: 8px;
+	        padding: 12px 14px;
+	        border: 1px solid rgba(148,163,184,0.18);
+	        border-radius: 16px;
+	        background: rgba(248,250,252,0.72);
+	        flex: initial;
+	      }
+	      .composer-group.primary-group {
+	        background: linear-gradient(180deg, rgba(255,255,255,0.96) 0%, rgba(240,249,255,0.92) 100%);
+	        border-color: rgba(125, 211, 252, 0.35);
+	      }
+	      .composer-group-body {
+	        display: grid;
+	        gap: 8px;
+	        grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+	      }
+	      .action-group {
+	        grid-template-columns: 1fr;
+	        gap: 8px;
+	      }
+	      .action-group-label {
+	        padding-top: 0;
 	      }
 	    }
 	  </style>
@@ -7497,7 +7793,7 @@ INDEX_HTML = r"""<!doctype html>
               <select id="sourceFilter">
                 <option value="">全部可见客户端</option>
               </select>
-              <label class="toggle"><input id="archived" type="checkbox" checked /> 含归档</label>
+              <label class="toggle"><input id="archived" type="checkbox" checked /> 含归档/已删除</label>
               <select id="limit">
                 <option value="100">100</option>
                 <option value="300" selected>300</option>
@@ -7612,15 +7908,30 @@ INDEX_HTML = r"""<!doctype html>
 	            </div>
 	            <textarea id="liveComposerInput" class="composer-input" placeholder="在这里给当前会话补一句话。留空时可以直接用“继续自动推进”。"></textarea>
 	            <div class="composer-actions">
-	              <button id="liveSendBtn" type="button" class="primary">发送这句话</button>
-	              <button id="liveContinueBtn" type="button">继续自动推进</button>
-	              <button id="liveStopBtn" type="button" class="danger">停止网页续跑</button>
-	              <button id="liveRefreshBtn" type="button">刷新窗口</button>
-	              <button id="liveHistoryBtn" type="button">最近 5 轮</button>
-	              <button id="liveResumeCmdBtn" type="button">复制恢复命令</button>
-	              <button id="liveSetTitleBtn" type="button">设标题</button>
-	              <button id="liveSetSourceBtn" type="button">设可见客户端</button>
-	              <button id="liveSetWorkdirBtn" type="button">设工作目录</button>
+	              <div class="composer-group primary-group">
+	                <div class="composer-group-title">主动作</div>
+	                <div class="composer-group-body">
+	                  <button id="liveSendBtn" type="button" class="primary">发送这句话</button>
+	                  <button id="liveContinueBtn" type="button">继续自动推进</button>
+	                  <button id="liveStopBtn" type="button" class="danger">停止网页续跑</button>
+	                </div>
+	              </div>
+	              <div class="composer-group">
+	                <div class="composer-group-title">查看与恢复</div>
+	                <div class="composer-group-body">
+	                  <button id="liveRefreshBtn" type="button">刷新窗口</button>
+	                  <button id="liveHistoryBtn" type="button">最近 5 轮</button>
+	                  <button id="liveResumeCmdBtn" type="button">复制恢复命令</button>
+	                </div>
+	              </div>
+	              <div class="composer-group">
+	                <div class="composer-group-title">元数据</div>
+	                <div class="composer-group-body">
+	                  <button id="liveSetTitleBtn" type="button">设标题</button>
+	                  <button id="liveSetSourceBtn" type="button">设可见客户端</button>
+	                  <button id="liveSetWorkdirBtn" type="button">设工作目录</button>
+	                </div>
+	              </div>
 	            </div>
 	            <div class="live-note">这不是完整历史浏览器，而是值班台：默认只看“现在”和“刚刚发生的事”。窗口只保留最近一小段 event timeline；需要时再向前翻最近 5 轮。</div>
 	          </div>
@@ -8274,7 +8585,9 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     function stateChipLabel(session) {
-      return session.archived ? "已归档" : "活动";
+      if (session.deleted) return "已删除";
+      if (session.archived) return "已归档";
+      return "活动";
     }
 
     function chip(text, className = "") {
@@ -9040,6 +9353,13 @@ INDEX_HTML = r"""<!doctype html>
 	      return "展开详细内容";
 	    }
 
+	    function shouldHideLiveEvent(event) {
+	      const kind = String(event.kind || "").trim();
+	      if (kind === "token_count") return true;
+	      if (kind === "tool_call" && String(event.tool_name || "").trim() === "write_stdin") return true;
+	      return false;
+	    }
+
 	    function renderLivePanel() {
 	      const previousScrollTop = liveEventsEl.scrollTop;
 	      const shouldStick = state.liveForceScrollBottom || state.liveStickToBottom || isNearBottom(liveEventsEl);
@@ -9066,7 +9386,8 @@ INDEX_HTML = r"""<!doctype html>
 	      liveStatusRowEl.appendChild(chip(progressStateLabel(progress.state), progressChipClass(progress.state)));
 	      liveStatusRowEl.appendChild(chip(attentionStateLabel(progress.attention_state), progressChipClass(progress.attention_state)));
 	      liveStatusRowEl.appendChild(chip(session.source_short_label || session.source_label || "-", "accent"));
-	      if (session.archived) liveStatusRowEl.appendChild(chip("已归档", "warn"));
+	      if (session.deleted) liveStatusRowEl.appendChild(chip("已删除", "danger"));
+	      else if (session.archived) liveStatusRowEl.appendChild(chip("已归档", "warn"));
 	      if (progress.last_assistant_phase) liveStatusRowEl.appendChild(chip(`phase: ${progress.last_assistant_phase}`));
 
 	      liveActionsEl.innerHTML = "";
@@ -9079,21 +9400,36 @@ INDEX_HTML = r"""<!doctype html>
 	        notes.push(`最近工具: ${visibleTools.join(", ")}${hiddenCount ? ` +${hiddenCount}` : ""}`);
 	      }
 	      if (!notes.length) notes.push("这个面板会持续滚动显示当前会话的 event timeline。");
+	      const actionsHead = document.createElement("div");
+	      actionsHead.className = "live-actions-head";
+	      const actionsTitle = document.createElement("div");
+	      actionsTitle.className = "live-actions-title";
+	      actionsTitle.textContent = "当前判断";
+	      actionsHead.appendChild(actionsTitle);
+	      const actionsMeta = document.createElement("div");
+	      actionsMeta.className = "live-actions-note";
+	      actionsMeta.textContent = `${stateChipLabel(session)} · ${session.source_short_label || session.source_label || "-"} · ${sessionModelText(session)}`;
+	      actionsHead.appendChild(actionsMeta);
+	      liveActionsEl.appendChild(actionsHead);
+	      const actionsBody = document.createElement("div");
+	      actionsBody.className = "live-actions-body";
 	      for (const note of notes.slice(0, 3)) {
 	        const pill = document.createElement("div");
 	        pill.className = "status-pill";
 	        pill.textContent = note;
-	        liveActionsEl.appendChild(pill);
+	        actionsBody.appendChild(pill);
 	      }
+	      liveActionsEl.appendChild(actionsBody);
 
+	      const visibleLiveEvents = state.liveEvents.filter((event) => !shouldHideLiveEvent(event));
 	      liveEventsEl.innerHTML = "";
-	      if (!state.liveEvents.length) {
+	      if (!visibleLiveEvents.length) {
 	        const empty = document.createElement("div");
 	        empty.className = "live-empty";
 	        empty.textContent = `还没有抓到近期事件，稍等自动刷新。这个窗口默认只保留最近 ${LIVE_EVENT_WINDOW} 条事件。`;
 	        liveEventsEl.appendChild(empty);
 	      } else {
-	        for (const event of state.liveEvents) {
+	        for (const event of visibleLiveEvents) {
 	          const kind = String(event.kind || "");
 	          const bodyHtml = eventBodyHtml(event);
 	          const collapseByDefault = shouldCollapseEventBody(event);
@@ -9169,17 +9505,20 @@ INDEX_HTML = r"""<!doctype html>
 	        });
 	      }
 
-	      liveComposerHelpEl.textContent = `${sessionStatusSummary(session)} · 窗口保留最近 ${LIVE_EVENT_WINDOW} 条事件`;
-	      liveSendBtnEl.disabled = false;
-	      liveContinueBtnEl.disabled = false;
-	      liveStopBtnEl.disabled = !sessionRemoteRunning(session);
+	      const isDeleted = Boolean(session.deleted);
+	      liveComposerHelpEl.textContent = isDeleted
+	        ? `${sessionStatusSummary(session)} · 已删除会话只能查看或恢复，不能继续续跑`
+	        : `${sessionStatusSummary(session)} · 窗口保留最近 ${LIVE_EVENT_WINDOW} 条事件`;
+	      liveSendBtnEl.disabled = isDeleted;
+	      liveContinueBtnEl.disabled = isDeleted;
+	      liveStopBtnEl.disabled = isDeleted || !sessionRemoteRunning(session);
 	      liveRefreshBtnEl.disabled = false;
 	      liveHistoryBtnEl.disabled = false;
-	      liveResumeCmdBtnEl.disabled = false;
-	      liveSetTitleBtnEl.disabled = false;
-	      liveSetSourceBtnEl.disabled = false;
-	      liveSetWorkdirBtnEl.disabled = false;
-	      liveComposerInputEl.disabled = false;
+	      liveResumeCmdBtnEl.disabled = isDeleted;
+	      liveSetTitleBtnEl.disabled = isDeleted;
+	      liveSetSourceBtnEl.disabled = isDeleted;
+	      liveSetWorkdirBtnEl.disabled = isDeleted;
+	      liveComposerInputEl.disabled = isDeleted;
 	    }
 
 	    async function loadLiveEvents({ reset = false } = {}) {
@@ -9246,9 +9585,9 @@ INDEX_HTML = r"""<!doctype html>
       return label;
     }
 
-    function infoTile(label, value, monospace = false) {
+    function infoTile(label, value, monospace = false, extraClass = "") {
       const tile = document.createElement("div");
-      tile.className = "info-tile";
+      tile.className = `info-tile ${extraClass}`.trim();
 
       const key = document.createElement("div");
       key.className = "info-label";
@@ -9262,9 +9601,9 @@ INDEX_HTML = r"""<!doctype html>
       return tile;
     }
 
-    function richInfoTile(label, nodes) {
+    function richInfoTile(label, nodes, extraClass = "") {
       const tile = document.createElement("div");
-      tile.className = "info-tile rich";
+      tile.className = `info-tile rich ${extraClass}`.trim();
 
       const key = document.createElement("div");
       key.className = "info-label";
@@ -9298,27 +9637,29 @@ INDEX_HTML = r"""<!doctype html>
 
     function buildActionStack(session, options = {}) {
       const advancedOnly = Boolean(options.advancedOnly);
+      const isDeleted = Boolean(session.deleted);
+      const isArchived = Boolean(session.archived);
       const stack = document.createElement("div");
       stack.className = "action-stack";
-      const primary = buildActionGroup(advancedOnly ? "追加续跑" : "续跑", advancedOnly ? [
-        sessionRemoteRunning(session) ? actionButton("停止续跑", "danger", () => stopContinue(session)) : null,
+      const primary = isDeleted ? null : buildActionGroup("续跑控制", advancedOnly ? [
+        sessionRemoteRunning(session) ? actionButton("停止续跑", "danger", () => stopContinue(session)) : actionButton(DEFAULT_CONTINUE_LABEL, "primary", () => continueSession(session)),
         actionButton("人工补一句", "", () => customContinueSession(session)),
       ] : [
-        actionButton("最近 5 轮", "", () => viewHistory(session)),
         sessionRemoteRunning(session) ? actionButton("停止续跑", "danger", () => stopContinue(session)) : null,
         actionButton(DEFAULT_CONTINUE_LABEL, "primary", () => continueSession(session)),
         actionButton("人工补一句", "", () => customContinueSession(session)),
       ]);
-      const edit = buildActionGroup("元数据", [
+      const edit = isDeleted ? null : buildActionGroup("元数据", [
         actionButton("设标题", "", () => setSessionTitle(session)),
-        actionButton("清自定义标题", "", () => clearSessionTitle(session)),
         actionButton("设可见客户端", "", () => openSourceEditor(session)),
         actionButton("设工作目录", "", () => setSessionWorkdir(session)),
       ]);
-      const maintenance = buildActionGroup("维护", [
-        actionButton("复制终端恢复命令", "", () => copyResumeCmd(session)),
-        actionButton("归档会话", "warn", () => archiveSession(session)),
-        actionButton("删除会话", "danger", () => deleteSession(session)),
+      const maintenance = buildActionGroup("生命周期", [
+        !isDeleted ? actionButton("复制终端恢复命令", "", () => copyResumeCmd(session)) : null,
+        !isDeleted && !isArchived ? actionButton("归档会话", "warn", () => archiveSession(session)) : null,
+        isArchived ? actionButton("取消归档", "warn", () => unarchiveSession(session)) : null,
+        !isDeleted ? actionButton("删除会话", "danger", () => deleteSession(session)) : null,
+        isDeleted ? actionButton("恢复会话", "primary", () => restoreSession(session)) : null,
       ]);
       for (const group of [primary, edit, maintenance]) {
         if (group) stack.appendChild(group);
@@ -9374,11 +9715,17 @@ INDEX_HTML = r"""<!doctype html>
     function buildCompactActionBar(session) {
       const bar = document.createElement("div");
       bar.className = "compact-actions";
-      bar.appendChild(actionButton("最近 5 轮", "", () => viewHistory(session)));
-      if (sessionRemoteRunning(session)) {
-        bar.appendChild(actionButton("停止续跑", "danger", () => stopContinue(session)));
-      } else {
-        bar.appendChild(actionButton(DEFAULT_CONTINUE_LABEL, "primary", () => continueSession(session)));
+      if (!session.deleted) {
+        if (sessionRemoteRunning(session)) {
+          bar.appendChild(actionButton("停止续跑", "danger", () => stopContinue(session)));
+        } else {
+          bar.appendChild(actionButton(DEFAULT_CONTINUE_LABEL, "primary", () => continueSession(session)));
+        }
+        if (session.archived) {
+          bar.appendChild(actionButton("取消归档", "warn", () => unarchiveSession(session)));
+        } else {
+          bar.appendChild(actionButton("归档", "warn", () => archiveSession(session)));
+        }
       }
       const expanded = state.expandedSessionId === session.id;
       bar.appendChild(actionButton(expanded ? "收起操作" : "更多操作", "", () => toggleSessionDetails(session)));
@@ -9425,21 +9772,21 @@ INDEX_HTML = r"""<!doctype html>
     function buildQuickUtilityRow(session) {
       const row = document.createElement("div");
       row.className = "session-utility-row";
-      row.appendChild(actionButton("复制会话 ID", "", () => copyText(session.id, `已复制会话 ID: ${session.id}`)));
+      row.appendChild(actionButton("复制会话 ID", "utility-link", () => copyText(session.id, `已复制会话 ID: ${session.id}`)));
 
       const cwdRaw = String(session.cwd_raw || session.cwd || "").trim();
       if (cwdRaw) {
-        row.appendChild(actionButton("复制工作目录", "", () => copyText(cwdRaw, `已复制工作目录: ${cwdRaw}`)));
+        row.appendChild(actionButton("复制工作目录", "utility-link", () => copyText(cwdRaw, `已复制工作目录: ${cwdRaw}`)));
       }
 
       const sourceRaw = String(session.client_source || session.session_source || session.source || "").trim();
       if (sourceRaw) {
-        row.appendChild(actionButton("复制 source", "", () => copyText(sourceRaw, `已复制 source: ${sourceRaw}`)));
+        row.appendChild(actionButton("复制 source", "utility-link", () => copyText(sourceRaw, `已复制 source: ${sourceRaw}`)));
       }
 
       const parentId = parentSessionId(session);
       if (parentId) {
-        row.appendChild(actionButton("跳到父会话", "", () => focusSessionById(parentId)));
+        row.appendChild(actionButton("跳到父会话", "utility-link", () => focusSessionById(parentId)));
       }
 
       return row;
@@ -9461,12 +9808,12 @@ INDEX_HTML = r"""<!doctype html>
 
       const sourceDetails = buildSourceDetails(session).join(" | ");
       if (sourceDetails) {
-        grid.appendChild(infoTile("source", sourceDetails));
+        grid.appendChild(infoTile("source", sourceDetails, false, "subtle"));
       }
 
       const cwdRaw = String(session.cwd_raw || session.cwd || "").trim();
       if (cwdRaw) {
-        grid.appendChild(infoTile("工作目录", cwdRaw, true));
+        grid.appendChild(infoTile("工作目录", cwdRaw, true, "subtle"));
       }
 
       const slackValue = (session.slack_threads || []).join(", ");
@@ -9502,20 +9849,36 @@ INDEX_HTML = r"""<!doctype html>
       head.appendChild(headActions);
       panel.appendChild(head);
 
+      const meta = document.createElement("div");
+      meta.className = "session-detail-meta";
+      meta.appendChild(chip(stateChipLabel(session), session.deleted ? "danger" : (session.archived ? "warn" : "accent")));
+      if (session.alias) meta.appendChild(chip("有别名"));
+      if (sessionRemoteRunning(session)) meta.appendChild(chip("网页续跑中", "warn"));
+      if (session.source_short_label || session.source_label) {
+        meta.appendChild(chip(session.source_short_label || session.source_label, "accent"));
+      }
+      panel.appendChild(meta);
+
       const layout = document.createElement("div");
       layout.className = "session-detail-layout";
 
-      layout.appendChild(buildQuickUtilityRow(session));
-
+      const sidebar = document.createElement("div");
+      sidebar.className = "session-detail-sidebar";
       const actions = document.createElement("div");
       actions.className = "session-detail-actions";
       actions.appendChild(buildActionStack(session, { advancedOnly: true }));
-      layout.appendChild(actions);
+      sidebar.appendChild(actions);
+      layout.appendChild(sidebar);
+
+      const main = document.createElement("div");
+      main.className = "session-detail-main";
+      main.appendChild(buildQuickUtilityRow(session));
 
       const contextGrid = buildContextGrid(session);
       if (contextGrid.children.length) {
-        layout.appendChild(contextGrid);
+        main.appendChild(contextGrid);
       }
+      layout.appendChild(main);
 
       panel.appendChild(layout);
       return panel;
@@ -9676,7 +10039,7 @@ INDEX_HTML = r"""<!doctype html>
         const tdState = document.createElement("td");
         const stateRow = document.createElement("div");
         stateRow.className = "chip-row";
-        stateRow.appendChild(chip(stateChipLabel(session), session.archived ? "warn" : "accent"));
+        stateRow.appendChild(chip(stateChipLabel(session), session.deleted ? "danger" : (session.archived ? "warn" : "accent")));
         if (sessionRemoteRunning(session)) stateRow.appendChild(chip("网页续跑中", "warn"));
         if (session.alias) stateRow.appendChild(chip("有别名"));
         tdState.appendChild(stateRow);
@@ -9768,6 +10131,10 @@ INDEX_HTML = r"""<!doctype html>
 	          footer.appendChild(tools);
 	        }
 
+	        const actionRow = document.createElement("div");
+	        actionRow.className = "fleet-card-footer-row";
+	        actionRow.appendChild(buildCompactActionBar(session));
+
 	        const selectLabel = document.createElement("label");
 	        selectLabel.className = "fleet-card-select";
 	        selectLabel.addEventListener("click", (event) => event.stopPropagation());
@@ -9780,8 +10147,15 @@ INDEX_HTML = r"""<!doctype html>
 	        });
 	        selectLabel.appendChild(checkbox);
 	        selectLabel.appendChild(document.createTextNode("批量"));
-	        footer.appendChild(selectLabel);
+	        actionRow.appendChild(selectLabel);
+	        footer.appendChild(actionRow);
 	        card.appendChild(footer);
+
+	        if (state.expandedSessionId === session.id) {
+	          const detail = buildExpandedDetailPanel(session);
+	          detail.addEventListener("click", (event) => event.stopPropagation());
+	          card.appendChild(detail);
+	        }
 
 	        cardsEl.appendChild(card);
 	      }
@@ -9929,13 +10303,41 @@ INDEX_HTML = r"""<!doctype html>
       }
     }
 
+    async function unarchiveSession(session) {
+      if (!confirm(`取消归档 ${session.id} ?`)) return;
+      try {
+        await api("/api/unarchive", {
+          method: "POST",
+          headers: jsonHeaders(),
+          body: JSON.stringify({ session: session.id })
+        });
+        await loadSessions();
+      } catch (error) {
+        toast(error.message, true);
+      }
+    }
+
     async function deleteSession(session) {
-      if (!confirm(`永久删除会话 ${session.id} ? 此操作不可恢复。`)) return;
+      if (!confirm(`将会话 ${session.id} 移到已删除，可稍后恢复。`)) return;
       try {
         await api("/api/delete", {
           method: "POST",
           headers: jsonHeaders(),
           body: JSON.stringify({ session: session.id, confirm: "DELETE" })
+        });
+        await loadSessions();
+      } catch (error) {
+        toast(error.message, true);
+      }
+    }
+
+    async function restoreSession(session) {
+      if (!confirm(`恢复会话 ${session.id} ?`)) return;
+      try {
+        await api("/api/restore", {
+          method: "POST",
+          headers: jsonHeaders(),
+          body: JSON.stringify({ session: session.id })
         });
         await loadSessions();
       } catch (error) {
@@ -10018,7 +10420,7 @@ INDEX_HTML = r"""<!doctype html>
         const data = await api(`/api/stats?q=${query}&source_label=${sourceLabel}&archived=${archived}`);
         const stats = data.stats;
         toast(
-          `总数=${stats.total}，活动=${stats.active}，归档=${stats.archived}，` +
+          `总数=${stats.total}，活动=${stats.active}，归档=${stats.archived}，已删除=${stats.deleted || 0}，` +
           `别名=${stats.with_alias}，Slack=${stats.with_slack_thread}`
         );
       } catch (error) {
@@ -10047,7 +10449,7 @@ INDEX_HTML = r"""<!doctype html>
     async function batchDeleteSelected() {
       const ids = state.sessions.filter((session) => state.selected.has(session.id)).map((session) => session.id);
       if (!ids.length) return toast("请先选择要删除的会话", true);
-      const confirmText = prompt(`即将永久删除 ${ids.length} 条会话，输入 DELETE 确认`);
+      const confirmText = prompt(`即将把 ${ids.length} 条会话移到已删除，输入 DELETE 确认`);
       if (confirmText !== "DELETE") return toast("已取消批量删除");
       try {
         const data = await api("/api/batch_delete", {
@@ -10057,7 +10459,7 @@ INDEX_HTML = r"""<!doctype html>
         });
         state.selected.clear();
         await loadSessions();
-        toast(`批量删除完成: deleted=${data.deleted}, not_found=${data.not_found}, missing_file=${data.missing_file}`);
+        toast(`批量删除完成: deleted=${data.deleted}, not_found=${data.not_found}, conflict=${data.missing_file}`);
       } catch (error) {
         toast(error.message, true);
       }

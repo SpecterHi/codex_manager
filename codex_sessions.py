@@ -128,6 +128,7 @@ class SessionRecord:
     path: Path
     session_size_bytes: int
     archived: bool
+    deleted: bool
     slack_threads: List[str]
     alias: str
     parent_session_id: str
@@ -231,6 +232,53 @@ def session_record_display_name(record: SessionRecord) -> str:
         )
         or record.session_id
     )
+
+
+def session_record_state(record: SessionRecord) -> str:
+    if getattr(record, "deleted", False):
+        return "deleted"
+    if getattr(record, "archived", False):
+        return "archived"
+    return "active"
+
+
+SESSION_FILENAME_DATE_RE = re.compile(r"(\d{4})-(\d{2})-(\d{2})T")
+
+
+def session_date_parts(record: SessionRecord) -> tuple[str, str, str]:
+    timestamp = str(getattr(record, "timestamp", "") or "").strip()
+    if timestamp:
+        normalized = timestamp.replace("Z", "+00:00")
+        try:
+            parsed = datetime.fromisoformat(normalized)
+            return (f"{parsed.year:04d}", f"{parsed.month:02d}", f"{parsed.day:02d}")
+        except ValueError:
+            pass
+    match = SESSION_FILENAME_DATE_RE.search(record.path.name)
+    if match:
+        return match.group(1), match.group(2), match.group(3)
+    return "unknown", "unknown", "unknown"
+
+
+def active_session_path(codex_home: Path, record: SessionRecord) -> Path:
+    year, month, day = session_date_parts(record)
+    return codex_home / "sessions" / year / month / day / record.path.name
+
+
+def archived_session_path(codex_home: Path, record: SessionRecord) -> Path:
+    return codex_home / "archived_sessions" / record.path.name
+
+
+def deleted_session_path(codex_home: Path, record: SessionRecord) -> Path:
+    return codex_home / "deleted_sessions" / record.path.name
+
+
+def move_session_record(record: SessionRecord, destination: Path) -> Path:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists():
+        raise FileExistsError(f"target already exists: {display_path(destination)}")
+    shutil.move(str(record.path), str(destination))
+    return destination
 
 
 def infer_source_from_originator(originator: str) -> str:
@@ -493,6 +541,7 @@ def read_jsonl_meta(path: Path) -> Optional[SessionRecord]:
                 path=path,
                 session_size_bytes=session_size_bytes,
                 archived=("archived_sessions" in path.parts),
+                deleted=("deleted_sessions" in path.parts),
                 slack_threads=[],
                 alias="",
                 parent_session_id="",
@@ -668,7 +717,13 @@ def update_first_user_preview(path: Path, title: str) -> Dict[str, Any]:
     }
 
 
-def iter_session_files(codex_home: Path, include_archived: bool) -> Iterable[Path]:
+def iter_session_files(
+    codex_home: Path,
+    include_archived: bool,
+    include_deleted: Optional[bool] = None,
+) -> Iterable[Path]:
+    if include_deleted is None:
+        include_deleted = include_archived
     sessions_root = codex_home / "sessions"
     if sessions_root.exists():
         for path in sessions_root.rglob("*.jsonl"):
@@ -679,6 +734,12 @@ def iter_session_files(codex_home: Path, include_archived: bool) -> Iterable[Pat
         archived_root = codex_home / "archived_sessions"
         if archived_root.exists():
             for path in archived_root.glob("*.jsonl"):
+                if path.is_file():
+                    yield path
+    if include_deleted:
+        deleted_root = codex_home / "deleted_sessions"
+        if deleted_root.exists():
+            for path in deleted_root.glob("*.jsonl"):
                 if path.is_file():
                     yield path
 
@@ -1461,6 +1522,19 @@ def set_session_title(
     previous["effective_title"] = effective_title
     sync_codex_home = codex_home or aliases_db.parent
     previous.update(
+        update_thread_state_metadata(
+            codex_home=sync_codex_home,
+            session_id=record.session_id,
+            title=effective_title,
+            updated_at=int(time.time()),
+        )
+    )
+    previous["session_index_appended"] = append_session_index_entry(
+        sync_codex_home,
+        record.session_id,
+        effective_title,
+    )
+    previous.update(
         sync_official_title_to_targets(
             session_id=record.session_id,
             title=effective_title,
@@ -1537,6 +1611,7 @@ def load_records(
     include_archived: bool,
     slack_db: Optional[Path],
     aliases_db: Optional[Path],
+    include_deleted: Optional[bool] = None,
 ) -> List[SessionRecord]:
     slack_index = load_slack_index(slack_db)
     override_index = load_overrides(aliases_db)
@@ -1544,7 +1619,11 @@ def load_records(
     thread_name_index = load_thread_name_index(codex_home)
     vscode_task_title_index = load_vscode_task_title_index(codex_home)
     records: List[SessionRecord] = []
-    for path in iter_session_files(codex_home=codex_home, include_archived=include_archived):
+    for path in iter_session_files(
+        codex_home=codex_home,
+        include_archived=include_archived,
+        include_deleted=include_deleted,
+    ):
         record = read_jsonl_meta(path)
         if not record:
             continue
@@ -1706,7 +1785,7 @@ def print_list(records: List[SessionRecord], limit: int) -> None:
     for record in records:
         if count >= limit:
             break
-        state = "archived" if record.archived else "active"
+        state = session_record_state(record)
         src = describe_source(record.originator, record.source)["label"]
         slack = ",".join(record.slack_threads) if record.slack_threads else "-"
         alias = record.alias or "-"
@@ -1755,8 +1834,9 @@ def cmd_stats(args: argparse.Namespace) -> int:
         aliases_db=args.aliases_db,
     )
     records = filter_records(records, "", getattr(args, "source_label", ""))
-    active = sum(1 for record in records if not record.archived)
+    active = sum(1 for record in records if not record.archived and not record.deleted)
     archived = sum(1 for record in records if record.archived)
+    deleted = sum(1 for record in records if record.deleted)
     originator = Counter(record.originator or "unknown" for record in records)
     source = Counter(describe_source(record.originator, record.source)["long_label"] for record in records)
     model = Counter(record.model or "unknown" for record in records)
@@ -1768,6 +1848,7 @@ def cmd_stats(args: argparse.Namespace) -> int:
     print(f"total: {len(records)}")
     print(f"active: {active}")
     print(f"archived: {archived}")
+    print(f"deleted: {deleted}")
     print(f"mapped_to_slack_thread: {with_slack}")
     print(f"with_alias: {with_alias}")
     print("\noriginator:")
@@ -1800,7 +1881,7 @@ def cmd_show(args: argparse.Namespace) -> int:
     print(f"official_title: {record.thread_name or '(none)'}")
     print(f"display_name: {session_record_display_name(record)}")
     print(f"time: {record.timestamp}")
-    print(f"state: {'archived' if record.archived else 'active'}")
+    print(f"state: {session_record_state(record)}")
     print(f"path: {display_path(record.path)}")
     print(f"size: {format_size(record.session_size_bytes)} ({record.session_size_bytes} bytes)")
     print(f"workdir: {display_path(record.cwd) if record.cwd else '(none)'}")
@@ -1842,6 +1923,9 @@ def cmd_resume(args: argparse.Namespace) -> int:
         aliases_db=args.aliases_db,
     )
     record = find_record(records, args.session_id)
+    if record.deleted:
+        print(f"Deleted session must be restored before resume: {record.session_id}")
+        return 1
     codex_bin = args.codex_bin
 
     if args.non_interactive:
@@ -2146,7 +2230,7 @@ def cmd_list_aliases(args: argparse.Namespace) -> int:
     for session_id, alias in sorted(aliases.items(), key=lambda item: item[1].lower()):
         record = by_id.get(session_id)
         if record:
-            state = "archived" if record.archived else "active"
+            state = session_record_state(record)
             cwd = short(display_path(record.cwd) if record.cwd else "-", 80)
         else:
             state = "missing"
@@ -2167,19 +2251,47 @@ def cmd_archive(args: argparse.Namespace) -> int:
         aliases_db=args.aliases_db,
     )
     record = find_record(records, args.session_id)
+    if record.deleted:
+        print(f"Cannot archive deleted session {record.session_id}; restore it first.")
+        return 1
     if record.archived:
         print(f"Already archived: {record.session_id}")
         return 0
 
-    dst_dir = args.codex_home / "archived_sessions"
-    dst_dir.mkdir(parents=True, exist_ok=True)
-    dst_path = dst_dir / record.path.name
-    if dst_path.exists():
+    dst_path = archived_session_path(args.codex_home, record)
+    try:
+        move_session_record(record, dst_path)
+    except FileExistsError:
         print(f"Archive target already exists: {display_path(dst_path)}")
         return 1
-
-    shutil.move(str(record.path), str(dst_path))
     print(f"Archived: {record.session_id}")
+    print(f"from: {display_path(record.path)}")
+    print(f"to:   {display_path(dst_path)}")
+    return 0
+
+
+def cmd_unarchive(args: argparse.Namespace) -> int:
+    records = load_records(
+        codex_home=args.codex_home,
+        include_archived=True,
+        slack_db=args.slack_db,
+        aliases_db=args.aliases_db,
+    )
+    record = find_record(records, args.session_id)
+    if record.deleted:
+        print(f"Cannot unarchive deleted session {record.session_id}; use restore instead.")
+        return 1
+    if not record.archived:
+        print(f"Session is not archived: {record.session_id}")
+        return 0
+
+    dst_path = active_session_path(args.codex_home, record)
+    try:
+        move_session_record(record, dst_path)
+    except FileExistsError:
+        print(f"Restore target already exists: {display_path(dst_path)}")
+        return 1
+    print(f"Unarchived: {record.session_id}")
     print(f"from: {display_path(record.path)}")
     print(f"to:   {display_path(dst_path)}")
     return 0
@@ -2197,9 +2309,64 @@ def cmd_delete(args: argparse.Namespace) -> int:
         aliases_db=args.aliases_db,
     )
     record = find_record(records, args.session_id)
+    if record.deleted:
+        print(f"Already deleted: {record.session_id}")
+        return 0
+    dst_path = deleted_session_path(args.codex_home, record)
+    try:
+        move_session_record(record, dst_path)
+    except FileExistsError:
+        print(f"Delete target already exists: {display_path(dst_path)}")
+        return 1
+    print(f"Soft-deleted: {record.session_id}")
+    print(f"from: {display_path(record.path)}")
+    print(f"to:   {display_path(dst_path)}")
+    return 0
+
+
+def cmd_restore(args: argparse.Namespace) -> int:
+    records = load_records(
+        codex_home=args.codex_home,
+        include_archived=True,
+        slack_db=args.slack_db,
+        aliases_db=args.aliases_db,
+    )
+    record = find_record(records, args.session_id)
+    if not record.deleted:
+        print(f"Session is not deleted: {record.session_id}")
+        return 0
+
+    dst_path = active_session_path(args.codex_home, record)
+    try:
+        move_session_record(record, dst_path)
+    except FileExistsError:
+        print(f"Restore target already exists: {display_path(dst_path)}")
+        return 1
+    print(f"Restored: {record.session_id}")
+    print(f"from: {display_path(record.path)}")
+    print(f"to:   {display_path(dst_path)}")
+    return 0
+
+
+def cmd_purge(args: argparse.Namespace) -> int:
+    if not args.yes:
+        print("Refusing to purge without --yes")
+        return 1
+
+    records = load_records(
+        codex_home=args.codex_home,
+        include_archived=True,
+        slack_db=args.slack_db,
+        aliases_db=args.aliases_db,
+    )
+    record = find_record(records, args.session_id)
+    if not record.deleted:
+        print(f"Refusing to purge non-deleted session {record.session_id}; soft-delete it first.")
+        return 1
+
     record.path.unlink(missing_ok=False)
     clear_session_overrides(args.aliases_db, record.session_id)
-    print(f"Deleted: {record.session_id}")
+    print(f"Purged: {record.session_id}")
     print(f"path: {display_path(record.path)}")
     return 0
 
@@ -2208,6 +2375,7 @@ def cmd_paths(args: argparse.Namespace) -> int:
     print(f"codex_home: {display_path(args.codex_home)}")
     print(f"sessions: {display_path(args.codex_home / 'sessions')}")
     print(f"archived_sessions: {display_path(args.codex_home / 'archived_sessions')}")
+    print(f"deleted_sessions: {display_path(args.codex_home / 'deleted_sessions')}")
     print(f"state_db: {display_path(args.codex_home / 'state_5.sqlite')}")
     print(
         "overrides_db: "
@@ -2261,7 +2429,7 @@ def build_parser(
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     list_parser = subparsers.add_parser("list", help="List sessions")
-    list_parser.add_argument("--archived", action="store_true", help="Include archived sessions")
+    list_parser.add_argument("--archived", action="store_true", help="Include archived and deleted sessions")
     list_parser.add_argument("--limit", type=int, default=50, help="Max rows to print")
     list_parser.add_argument("--grep", default="", help="Filter by substring")
     list_parser.add_argument(
@@ -2365,10 +2533,23 @@ def build_parser(
     archive_parser.add_argument("session_id", help="Session id or unique prefix")
     archive_parser.set_defaults(func=cmd_archive)
 
-    delete_parser = subparsers.add_parser("delete", help="Delete a session file permanently")
+    unarchive_parser = subparsers.add_parser("unarchive", help="Move a session from archived_sessions back to sessions/")
+    unarchive_parser.add_argument("session_id", help="Session id or unique prefix")
+    unarchive_parser.set_defaults(func=cmd_unarchive)
+
+    delete_parser = subparsers.add_parser("delete", help="Soft-delete a session into deleted_sessions")
     delete_parser.add_argument("session_id", help="Session id or unique prefix")
     delete_parser.add_argument("--yes", action="store_true", help="Required confirmation flag")
     delete_parser.set_defaults(func=cmd_delete)
+
+    restore_parser = subparsers.add_parser("restore", help="Restore a session from deleted_sessions")
+    restore_parser.add_argument("session_id", help="Session id or unique prefix")
+    restore_parser.set_defaults(func=cmd_restore)
+
+    purge_parser = subparsers.add_parser("purge", help="Permanently remove a deleted session file")
+    purge_parser.add_argument("session_id", help="Session id or unique prefix")
+    purge_parser.add_argument("--yes", action="store_true", help="Required confirmation flag")
+    purge_parser.set_defaults(func=cmd_purge)
 
     paths_parser = subparsers.add_parser("paths", help="Print storage paths")
     paths_parser.set_defaults(func=cmd_paths)

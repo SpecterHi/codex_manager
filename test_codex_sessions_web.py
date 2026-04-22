@@ -13,6 +13,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import codex_sessions_web as web  # noqa: E402
+import codex_sessions  # noqa: E402
 
 
 def write_jsonl(path: Path, rows: list[dict]) -> None:
@@ -22,6 +23,189 @@ def write_jsonl(path: Path, rows: list[dict]) -> None:
 
 
 class SessionEventsTest(unittest.TestCase):
+    def test_set_session_title_refreshes_thread_state_and_session_index(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            codex_home = Path(tmpdir) / ".codex"
+            session_path = codex_home / "sessions" / "2026" / "04" / "22" / "rollout-2026-04-22T10-00-00-demo.jsonl"
+            session_path.parent.mkdir(parents=True, exist_ok=True)
+            write_jsonl(
+                session_path,
+                [
+                    {
+                        "type": "session_meta",
+                        "payload": {
+                            "id": "sess-title-refresh",
+                            "timestamp": "2026-04-22T10:00:00Z",
+                            "cwd": "/tmp/demo",
+                            "originator": "vscode",
+                            "source": "vscode",
+                            "title": "old title",
+                        },
+                    }
+                ],
+            )
+
+            db_path = codex_home / "state_5.sqlite"
+            conn = codex_sessions.sqlite3.connect(str(db_path))
+            try:
+                conn.execute(
+                    "CREATE TABLE threads (id TEXT PRIMARY KEY, source TEXT, title TEXT, cwd TEXT, updated_at INTEGER)"
+                )
+                conn.execute(
+                    "INSERT INTO threads (id, source, title, cwd, updated_at) VALUES (?, ?, ?, ?, ?)",
+                    ("sess-title-refresh", "vscode", "old title", "/tmp/demo", 123),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            index_path = codex_home / "session_index.jsonl"
+            index_path.write_text(
+                json.dumps(
+                    {
+                        "id": "sess-title-refresh",
+                        "thread_name": "old title",
+                        "updated_at": "2026-04-22T10:00:00Z",
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            records = codex_sessions.load_records(
+                codex_home=codex_home,
+                include_archived=True,
+                slack_db=None,
+                aliases_db=codex_home / "session_aliases.json",
+            )
+            record = next(item for item in records if item.session_id == "sess-title-refresh")
+
+            with mock.patch.object(
+                codex_sessions,
+                "sync_official_title_to_targets",
+                return_value={"official_title_sync": "skipped", "official_title_sync_attempted": False},
+            ):
+                result = codex_sessions.set_session_title(
+                    record,
+                    codex_home / "session_aliases.json",
+                    "new visible title",
+                    codex_home=codex_home,
+                )
+
+            self.assertTrue(result["session_index_appended"])
+
+            conn = codex_sessions.sqlite3.connect(str(db_path))
+            try:
+                row = conn.execute(
+                    "SELECT title, updated_at FROM threads WHERE id = ?",
+                    ("sess-title-refresh",),
+                ).fetchone()
+            finally:
+                conn.close()
+            assert row is not None
+            self.assertEqual(row[0], "new visible title")
+            self.assertGreater(int(row[1]), 123)
+
+            latest_entry = None
+            for raw in index_path.read_text(encoding="utf-8").splitlines():
+                payload = json.loads(raw)
+                if payload.get("id") == "sess-title-refresh":
+                    latest_entry = payload
+            assert latest_entry is not None
+            self.assertEqual(latest_entry["thread_name"], "new visible title")
+
+    def test_load_records_distinguishes_active_archived_deleted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            codex_home = Path(tmpdir) / ".codex"
+            active_path = codex_home / "sessions" / "2026" / "04" / "21" / "rollout-2026-04-21T10-00-00-active.jsonl"
+            archived_path = codex_home / "archived_sessions" / "rollout-2026-04-20T10-00-00-archived.jsonl"
+            deleted_path = codex_home / "deleted_sessions" / "rollout-2026-04-19T10-00-00-deleted.jsonl"
+            for path, session_id in [
+                (active_path, "sess-active"),
+                (archived_path, "sess-archived"),
+                (deleted_path, "sess-deleted"),
+            ]:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                write_jsonl(
+                    path,
+                    [
+                        {
+                            "type": "session_meta",
+                            "payload": {
+                                "id": session_id,
+                                "timestamp": "2026-04-21T10:00:00Z",
+                                "cwd": "/tmp/demo",
+                                "originator": "vscode",
+                                "source": "vscode",
+                            },
+                        }
+                    ],
+                )
+
+            records = codex_sessions.load_records(
+                codex_home=codex_home,
+                include_archived=True,
+                slack_db=None,
+                aliases_db=codex_home / "session_aliases.json",
+            )
+            states = {record.session_id: codex_sessions.session_record_state(record) for record in records}
+            self.assertEqual(states["sess-active"], "active")
+            self.assertEqual(states["sess-archived"], "archived")
+            self.assertEqual(states["sess-deleted"], "deleted")
+
+    def test_build_stats_counts_deleted_separately(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            codex_home = Path(tmpdir) / ".codex"
+            active_path = codex_home / "sessions" / "2026" / "04" / "21" / "rollout-2026-04-21T10-00-00-active.jsonl"
+            archived_path = codex_home / "archived_sessions" / "rollout-2026-04-20T10-00-00-archived.jsonl"
+            deleted_path = codex_home / "deleted_sessions" / "rollout-2026-04-19T10-00-00-deleted.jsonl"
+            for path, session_id in [
+                (active_path, "sess-active"),
+                (archived_path, "sess-archived"),
+                (deleted_path, "sess-deleted"),
+            ]:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                write_jsonl(
+                    path,
+                    [
+                        {
+                            "type": "session_meta",
+                            "payload": {
+                                "id": session_id,
+                                "timestamp": "2026-04-21T10:00:00Z",
+                                "cwd": "/tmp/demo",
+                                "originator": "vscode",
+                                "source": "vscode",
+                            },
+                        }
+                    ],
+                )
+
+            app = web.AppContext(
+                codex_home=codex_home,
+                slack_db=None,
+                aliases_db=codex_home / "session_aliases.json",
+                codex_bin="codex",
+                auth=None,
+                targets_path=codex_home / "targets.json",
+                remote_marks_path=codex_home / "marks.json",
+                remote_watchlist_path=codex_home / "watch.json",
+                supervisor_lock_path=codex_home / "lock",
+                lock=threading.Lock(),
+                targets={},
+                resume_jobs={},
+                auth_failures={},
+                remote_marks={},
+                remote_watchlist={},
+                shutdown_event=threading.Event(),
+            )
+            stats = web.build_stats(app, include_archived=True, query="", source_label="")
+            self.assertEqual(stats["total"], 3)
+            self.assertEqual(stats["active"], 1)
+            self.assertEqual(stats["archived"], 1)
+            self.assertEqual(stats["deleted"], 1)
+
     def test_parse_target_base_url_accepts_loopback_default(self) -> None:
         host, port = web.parse_target_base_url("http://127.0.0.1:8765")
         self.assertEqual(host, "127.0.0.1")
